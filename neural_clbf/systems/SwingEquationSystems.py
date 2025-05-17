@@ -78,6 +78,7 @@ class SwingEquationSystem(ControlAffineSystem):
     @property
     def n_controls(self) -> int:
         return self.N_CONTROLS
+    
     @property
     def state_limits(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -85,8 +86,8 @@ class SwingEquationSystem(ControlAffineSystem):
         system
         """
         upper_limit = torch.ones(self.n_dims)
-        upper_limit[:self.N_NODES] = torch.pi  # theta limits
-        upper_limit[self.N_NODES:] = 2.0  # omega limits
+        upper_limit[:self.N_NODES - 1] = torch.pi  # theta limits
+        upper_limit[self.N_NODES - 1:] = 2.0  # omega limits
 
         lower_limit = -1.0 * upper_limit
 
@@ -155,7 +156,7 @@ class SwingEquationSystem(ControlAffineSystem):
         coupling_sum_1 = torch.zeros(batch_size).type_as(x)
         for j in range(1, self.N_NODES):
             coupling_sum_1 += K[i, j] * torch.sin(theta[:, j - 1])
-        f[:, i, 0] = (P[:, i] - D[:, i] * omega[:, i] - coupling_sum_1) / M[:, i]
+        f[:, self.N_NODES - 1 + i, 0] = (P[:, i] - D[:, i] * omega[:, i] - coupling_sum_1) / M[:, i]
 
         # For omega_i (i = 2, ..., n)
         for i in range(1, self.N_NODES):
@@ -206,3 +207,39 @@ class SwingEquationSystem(ControlAffineSystem):
         omega = x[:, self.N_NODES - 1:]
         u_nominal = -K * omega
         return u_nominal
+        
+    def create_realistic_scenarios(self, n_scenarios: int = 5, variation: float = 0.2) -> ScenarioList:
+        """
+        Create a list of realistic scenarios with varying parameters.
+        
+        args:
+            n_scenarios: number of scenarios to create
+            variation: the relative variation in parameters
+        returns:
+            scenarios: list of scenarios
+        """
+        scenarios = []
+        
+        # Use the nominal parameters as the base
+        base_params = self.nominal_params
+        
+        for i in range(n_scenarios):
+            # Create variations of the parameters
+            M_var = base_params["M"] * (1 + variation * (2 * torch.rand_like(base_params["M"]) - 1))
+            D_var = base_params["D"] * (1 + variation * (2 * torch.rand_like(base_params["D"]) - 1))
+            P_var = base_params["P"] + 0.1 * variation * (2 * torch.rand_like(base_params["P"]) - 1)
+            
+            # Keep K matrix structure but vary the coupling strengths
+            K_var = base_params["K"] * (1 + variation * (2 * torch.rand_like(base_params["K"]) - 1))
+            
+            # Create scenario
+            scenario = {
+                "M": M_var,
+                "D": D_var,
+                "P": P_var, 
+                "K": K_var
+            }
+            
+            scenarios.append(scenario)
+        
+        return scenarios

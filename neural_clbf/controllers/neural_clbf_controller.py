@@ -45,20 +45,22 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         scenarios: ScenarioList,
         datamodule: EpisodicDataModule,
         experiment_suite: ExperimentSuite,
-        clbf_hidden_layers: int = 2,
-        clbf_hidden_size: int = 48,
+        clbf_hidden_layers: int = 3,
+        clbf_hidden_size: int = 64,
         clf_lambda: float = 1.0,
         safe_level: float = 1.0,
         clf_relaxation_penalty: float = 50.0,
         controller_period: float = 0.01,
-        primal_learning_rate: float = 1e-3,
+        primal_learning_rate: float = 5e-4,
         epochs_per_episode: int = 5,
         penalty_scheduling_rate: float = 0.0,
         num_init_epochs: int = 5,
         barrier: bool = True,
-        add_nominal: bool = False,
-        normalize_V_nominal: bool = False,
+        add_nominal: bool = True,
+        normalize_V_nominal: bool = True,
         disable_gurobi: bool = False,
+        use_batch_norm: bool = True,
+        dropout_rate: float = 0.1,
     ):
         """Initialize the controller.
 
@@ -84,10 +86,9 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
                      effectively trains only a CLF.
             add_nominal: if True, add the nominal V
             normalize_V_nominal: if True, normalize V_nominal so that its average is 1
-            disable_gurobi: if True, Gurobi will not be used during evaluation. 
-                Default is train with CVXPYLayers, evaluate with Gurobi; 
-                setting this to true will evaluate with CVXPYLayers instead 
-                (to avoid requiring a Gurobi license)
+            disable_gurobi: if True, Gurobi will not be used during evaluation.
+            use_batch_norm: if True, use batch normalization in the network
+            dropout_rate: dropout rate for regularization
         """
         super(NeuralCLBFController, self).__init__(
             dynamics_model=dynamics_model,
@@ -101,7 +102,6 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         self.save_hyperparameters()
 
         # Save the provided model
-        # self.dynamics_model = dynamics_model
         self.scenarios = scenarios
         self.n_scenarios = len(scenarios)
 
@@ -122,6 +122,8 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         self.add_nominal = add_nominal
         self.normalize_V_nominal = normalize_V_nominal
         self.V_nominal_mean = 1.0
+        self.use_batch_norm = use_batch_norm
+        self.dropout_rate = dropout_rate
 
         # Compute and save the center and range of the state variables
         x_max, x_min = dynamics_model.state_limits
@@ -145,17 +147,30 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         self.clbf_hidden_size = clbf_hidden_size
         # We're going to build the network up layer by layer, starting with the input
         self.V_layers: OrderedDict[str, nn.Module] = OrderedDict()
+        
+        # Input layer
         self.V_layers["input_linear"] = nn.Linear(
             self.n_dims_extended, self.clbf_hidden_size
         )
-        self.V_layers["input_activation"] = nn.Tanh()
+        if self.use_batch_norm:
+            self.V_layers["input_bn"] = nn.BatchNorm1d(self.clbf_hidden_size)
+        self.V_layers["input_activation"] = nn.ReLU()
+        self.V_layers["input_dropout"] = nn.Dropout(self.dropout_rate)
+        
+        # Hidden layers
         for i in range(self.clbf_hidden_layers):
             self.V_layers[f"layer_{i}_linear"] = nn.Linear(
                 self.clbf_hidden_size, self.clbf_hidden_size
             )
+            if self.use_batch_norm:
+                self.V_layers[f"layer_{i}_bn"] = nn.BatchNorm1d(self.clbf_hidden_size)
             if i < self.clbf_hidden_layers - 1:
-                self.V_layers[f"layer_{i}_activation"] = nn.Tanh()
-        # self.V_layers["output_linear"] = nn.Linear(self.clbf_hidden_size, 1)
+                self.V_layers[f"layer_{i}_activation"] = nn.ReLU()
+                self.V_layers[f"layer_{i}_dropout"] = nn.Dropout(self.dropout_rate)
+        
+        # Output layer
+        self.V_layers["output_linear"] = nn.Linear(self.clbf_hidden_size, 1)
+        
         self.V_nn = nn.Sequential(self.V_layers)
 
     def prepare_data(self):
@@ -435,31 +450,30 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         return loss
 
     def training_step(self, batch, batch_idx):
-        """Conduct the training step for the given batch"""
-        # Extract the input and masks from the batch
+        """Training step for the CLBF controller."""
         x, goal_mask, safe_mask, unsafe_mask = batch
-
-        # Compute the losses
-        component_losses = {}
-        initial_loss = self.initial_loss(x)
-        component_losses.update(initial_loss)
-        component_losses.update(
-            self.boundary_loss(x, goal_mask, safe_mask, unsafe_mask)
-        )
-        component_losses.update(
-            self.descent_loss(x, goal_mask, safe_mask, unsafe_mask, requires_grad=True)
-        )
-
-        # Compute the overall loss by summing up the individual losses
-        total_loss = torch.tensor(0.0).type_as(x)
-        # For the objectives, we can just sum them
-        for _, loss_value in component_losses.items():
-            if not torch.isnan(loss_value):
-                total_loss = total_loss + loss_value
-
-        batch_dict = {"loss": total_loss, **component_losses}
-
-        return batch_dict
+        
+        # Compute losses
+        losses = []
+        
+        # Initial loss during pretraining
+        if self.current_epoch < self.num_init_epochs:
+            losses.extend(self.initial_loss(x))
+        else:
+            # Boundary loss
+            losses.extend(self.boundary_loss(x, goal_mask, safe_mask, unsafe_mask))
+            
+            # Descent loss
+            losses.extend(self.descent_loss(x))
+        
+        # Compute total loss
+        total_loss = sum(loss[1] for loss in losses)
+        
+        # Log losses
+        for name, value in losses:
+            self.log(f"train_{name}", value, prog_bar=True)
+        
+        return total_loss
 
     def training_epoch_end(self, outputs):
         """This function is called after every epoch is completed."""
@@ -496,35 +510,24 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
             self.log(loss_key + " / train", avg_losses[loss_key], sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
-        """Conduct the validation step for the given batch"""
-        # Extract the input and masks from the batch
+        """Validation step for the CLBF controller."""
         x, goal_mask, safe_mask, unsafe_mask = batch
-
-        # Get the various losses
-        component_losses = {}
-        component_losses.update(
-            self.boundary_loss(x, goal_mask, safe_mask, unsafe_mask)
-        )
-        component_losses.update(self.descent_loss(x, goal_mask, safe_mask, unsafe_mask))
-
-        # Compute the overall loss by summing up the individual losses
-        total_loss = torch.tensor(0.0).type_as(x)
-        # For the objectives, we can just sum them
-        for _, loss_value in component_losses.items():
-            if not torch.isnan(loss_value):
-                total_loss += loss_value
-
-        # Also compute the accuracy associated with each loss
-        component_losses.update(
-            self.boundary_loss(x, goal_mask, safe_mask, unsafe_mask, accuracy=True)
-        )
-        component_losses.update(
-            self.descent_loss(x, goal_mask, safe_mask, unsafe_mask, accuracy=True)
-        )
-
-        batch_dict = {"val_loss": total_loss, **component_losses}
-
-        return batch_dict
+        
+        # Compute losses with accuracy
+        losses = self.boundary_loss(x, goal_mask, safe_mask, unsafe_mask, accuracy=True)
+        losses.extend(self.descent_loss(x, accuracy=True))
+        
+        # Compute total loss
+        total_loss = sum(loss[1] for loss in losses if not isinstance(loss[1], float))
+        
+        # Log losses and accuracies
+        for name, value in losses:
+            if isinstance(value, float):
+                self.log(f"val_{name}", value, prog_bar=True)
+            else:
+                self.log(f"val_{name}", value)
+        
+        return total_loss
 
     def validation_epoch_end(self, outputs):
         """This function is called after every epoch is completed."""
@@ -613,14 +616,34 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
             self.datamodule.add_data(simulator_fn_wrapper)
 
     def configure_optimizers(self):
+        """Configure the optimizers for training."""
         clbf_params = list(self.V_nn.parameters())
 
-        clbf_opt = torch.optim.SGD(
+        # Use Adam optimizer with weight decay
+        clbf_opt = torch.optim.AdamW(
             clbf_params,
             lr=self.primal_learning_rate,
-            weight_decay=1e-6,
+            weight_decay=1e-4,  # Increased weight decay
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+
+        # Add learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            clbf_opt,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True,
+            min_lr=1e-6,
         )
 
         self.opt_idx_dict = {0: "clbf"}
 
-        return [clbf_opt]
+        return {
+            "optimizer": clbf_opt,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
+        }

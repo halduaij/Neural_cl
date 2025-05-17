@@ -33,6 +33,7 @@ class CLFController(Controller):
         clf_relaxation_penalty: float = 50.0,
         controller_period: float = 0.01,
         disable_gurobi: bool = True,
+        cache_size: int = 1000,  # Add caching for better performance
     ):
         """Initialize the controller.
 
@@ -43,10 +44,8 @@ class CLFController(Controller):
             clf_lambda: convergence rate for the CLF
             clf_relaxation_penalty: the penalty for relaxing CLF conditions.
             controller_period: the timestep to use in simulating forward Vdot
-            disable_gurobi: if True, Gurobi will not be used during evaluation. 
-                Default is train with CVXPYLayers, evaluate with Gurobi; 
-                setting this to true will evaluate with CVXPYLayers instead 
-                (to avoid requiring a Gurobi license)
+            disable_gurobi: if True, Gurobi will not be used during evaluation.
+            cache_size: size of the LRU cache for computed control inputs
         """
         super(CLFController, self).__init__(
             dynamics_model=dynamics_model,
@@ -67,6 +66,10 @@ class CLFController(Controller):
         # Save the other parameters
         self.clf_lambda = clf_lambda
         self.clf_relaxation_penalty = clf_relaxation_penalty
+
+        # Initialize cache for computed control inputs
+        self.cache = {}
+        self.cache_size = cache_size
 
         # Since we want to be able to solve the CLF-QP differentiably, we need to set
         # up the CVXPyLayers optimization. First, we define variables for each control
@@ -185,6 +188,18 @@ class CLFController(Controller):
         """Determine the reference control input."""
         return self.dynamics_model.u_nominal(x)
 
+    def _get_cache_key(self, x: torch.Tensor) -> str:
+        """Generate a cache key for a state tensor."""
+        # Convert state to a string representation for caching
+        return str(x.detach().cpu().numpy().tobytes())
+
+    def _update_cache(self, key: str, value: torch.Tensor):
+        """Update the cache with a new key-value pair."""
+        if len(self.cache) >= self.cache_size:
+            # Remove oldest item if cache is full
+            self.cache.pop(next(iter(self.cache)))
+        self.cache[key] = value
+
     def _solve_CLF_QP_cvxpylayers(
         self,
         x: torch.Tensor,
@@ -221,15 +236,21 @@ class CLFController(Controller):
         params.append(u_ref)
         params.append(torch.tensor([relaxation_penalty]).type_as(x))
 
+        # Use solver with increased iterations for better accuracy
         result = self.differentiable_qp_solver(
             *params,
-            solver_args={"max_iters": 1000},
+            solver_args={
+                "max_iters": 2000,  # Increased from 1000
+                "eps": 1e-6,  # Tighter tolerance
+                "verbose": False,
+            },
         )
 
         u_result = result[0]
         r_result = torch.hstack(result[1:])
 
         return u_result.type_as(x), r_result.type_as(x)
+
     def solve_CLF_QP(
         self,
         x,
@@ -238,6 +259,11 @@ class CLFController(Controller):
         requires_grad: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Determine the control input for a given state using a QP"""
+        # Check cache first if not requiring gradients
+        if not requires_grad:
+            cache_key = self._get_cache_key(x)
+            if cache_key in self.cache:
+                return self.cache[cache_key]
 
         V = self.V(x)
         Lf_V, Lg_V = self.V_lie_derivatives(x)
@@ -249,7 +275,13 @@ class CLFController(Controller):
             relaxation_penalty = self.clf_relaxation_penalty
 
         # Ensure only CVXPY solver is used
-        return self._solve_CLF_QP_cvxpylayers(x, u_ref, V, Lf_V, Lg_V, relaxation_penalty)
+        result = self._solve_CLF_QP_cvxpylayers(x, u_ref, V, Lf_V, Lg_V, relaxation_penalty)
+
+        # Cache the result if not requiring gradients
+        if not requires_grad:
+            self._update_cache(cache_key, result)
+
+        return result
 
     def u(self, x):
         """Get the control input for a given state"""
