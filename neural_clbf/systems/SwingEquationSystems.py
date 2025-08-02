@@ -29,7 +29,8 @@ class SwingEquationSystem(ControlAffineSystem):
         dt: float = 0.01,
         controller_dt: Optional[float] = None,
         scenarios: Optional[ScenarioList] = None,
-        goal_point: Optional[torch.Tensor] = None
+        goal_point: Optional[torch.Tensor] = None,
+        max_rocof: float = 1.0  # Maximum allowed Rate of Change of Frequency
     ):
         """
         Initialize the swing equation system.
@@ -41,10 +42,12 @@ class SwingEquationSystem(ControlAffineSystem):
             controller_dt: the timestep for the control discretization. Defaults to dt
             scenarios: optional list of scenarios to consider
             goal_point: optional tensor specifying the goal point for the system
+            max_rocof: maximum allowed Rate of Change of Frequency (Hz/s)
         """
         self.N_NODES = len(nominal_params["M"])
         self.N_DIMS = 2 * self.N_NODES - 1  # One less state due to using difference
         self.N_CONTROLS = self.N_NODES
+        self.max_rocof = max_rocof  # Store maximum allowed RoCoF
 
         self._goal_point = goal_point if goal_point is not None else torch.zeros((1, self.n_dims))
 
@@ -116,13 +119,119 @@ class SwingEquationSystem(ControlAffineSystem):
         goal_tolerance = 0.1
         return torch.all(torch.abs(x - self.goal_point) < goal_tolerance, dim=1)
 
-    def safe_mask(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the mask of x indicating safe regions"""
-        return torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+    def compute_rocof(self, x: torch.Tensor, u: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute the Rate of Change of Frequency (RoCoF) for each generator.
+        
+        RoCoF is the time derivative of the frequency, which is directly
+        related to omega_dot in our state space formulation.
+        
+        args:
+            x: bs x self.n_dims tensor of state
+            u: bs x self.n_controls tensor of control inputs (optional)
+        
+        returns:
+            rocof: bs x self.N_NODES tensor of RoCoF values for each node
+        """
+        batch_size = x.shape[0]
+        
+        # Get dynamics with the nominal scenario parameters
+        f = self._f(x, self.nominal_params)
+        
+        # If control inputs are provided, include their effect
+        if u is not None:
+            g = self._g(x, self.nominal_params)
+            u_reshaped = u.reshape(-1, self.n_controls, 1)
+            dynamics = f + torch.bmm(g, u_reshaped)
+        else:
+            # Just use unforced dynamics (or use nominal control)
+            u_nominal = self.u_nominal(x)
+            g = self._g(x, self.nominal_params)
+            u_reshaped = u_nominal.reshape(-1, self.n_controls, 1)
+            dynamics = f + torch.bmm(g, u_reshaped)
+        
+        # Extract the dynamics of omega (which gives us RoCoF)
+        # We multiply by 60/(2*pi) to convert from rad/s^2 to Hz/s if needed
+        # (standard power system frequency unit, assuming 60Hz system)
+        conversion_factor = 60.0 / (2.0 * np.pi)
+        rocof = dynamics[:, self.N_NODES-1:, 0] * conversion_factor
+        
+        return rocof
 
-    def unsafe_mask(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the mask of x indicating unsafe regions"""
-        return torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+    def safe_mask(self, x: torch.Tensor, u: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Return the mask of x indicating safe regions based on RoCoF constraints.
+        
+        args:
+            x: bs x self.n_dims tensor of state
+            u: bs x self.n_controls tensor of control inputs (optional)
+            
+        returns:
+            safe_mask: bs tensor of booleans indicating safe states
+        """
+        # First check if state is within usual limits
+        upper_limit, lower_limit = self.state_limits
+        within_limits = torch.all((x <= upper_limit) & (x >= lower_limit), dim=1)
+        
+        # Then compute RoCoF for each generator
+        rocof = self.compute_rocof(x, u)
+        
+        # Check if RoCoF is within acceptable limits for all generators
+        rocof_safe = torch.all(torch.abs(rocof) <= self.max_rocof, dim=1)
+        
+        # State is safe if both conditions are met
+        return within_limits & rocof_safe
+
+    def unsafe_mask(self, x: torch.Tensor, u: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Return the mask of x indicating unsafe regions based on RoCoF constraints.
+        
+        args:
+            x: bs x self.n_dims tensor of state
+            u: bs x self.n_controls tensor of control inputs (optional)
+            
+        returns:
+            unsafe_mask: bs tensor of booleans indicating unsafe states
+        """
+        # First check if state is outside usual limits
+        upper_limit, lower_limit = self.state_limits
+        outside_limits = torch.any((x > upper_limit) | (x < lower_limit), dim=1)
+        
+        # Then compute RoCoF for each generator
+        rocof = self.compute_rocof(x, u)
+        
+        # Check if RoCoF exceeds acceptable limits for any generator
+        rocof_unsafe = torch.any(torch.abs(rocof) > self.max_rocof, dim=1)
+        
+        # State is unsafe if either condition is met
+        return outside_limits | rocof_unsafe
+
+    def get_rocof_barrier_value(self, x: torch.Tensor, u: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute the barrier function value based on RoCoF constraints.
+        
+        The barrier function is positive when the state is safe (RoCoF is within limits)
+        and negative when the state is unsafe (RoCoF exceeds limits).
+        
+        args:
+            x: bs x self.n_dims tensor of state
+            u: bs x self.n_controls tensor of control inputs (optional)
+            
+        returns:
+            barrier: bs tensor of barrier function values
+        """
+        # Compute RoCoF for each generator
+        rocof = self.compute_rocof(x, u)
+        
+        # Compute the margin to the RoCoF limit for each generator
+        # This is positive when RoCoF is within limits, negative when it exceeds
+        margins = self.max_rocof - torch.abs(rocof)
+        
+        # The barrier value is the minimum margin across all generators
+        # If any generator exceeds the limit, the barrier will be negative
+        barrier = torch.min(margins, dim=1)[0]
+        
+        return barrier
 
     def _f(self, x: torch.Tensor, params: Scenario) -> torch.Tensor:
         """

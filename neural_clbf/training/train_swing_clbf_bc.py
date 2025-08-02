@@ -19,36 +19,40 @@ from neural_clbf.datamodules.episodic_datamodule import EpisodicDataModule
 from neural_clbf.controllers.clf_controller import CLFController
 from neural_clbf.training.lyapunov_falsification import LyapunovFalsifier
 
-def create_swing_system(n_nodes: int = 3, dt: float = 0.01) -> Tuple[SwingEquationSystem, ScenarioList]:
+def create_swing_system(n_nodes: int = 3, dt: float = 0.01, max_rocof: float = 1.0) -> Tuple[SwingEquationSystem, ScenarioList]:
     """Create a swing equation system with n nodes.
 
     args:
         n_nodes: number of nodes in the system
         dt: timestep for simulation and control
+        max_rocof: maximum allowed Rate of Change of Frequency (Hz/s)
     returns:
         system: the swing equation system
         scenarios: list of scenarios
     """
-    # Create nominal parameters with a bit more variation than the basic setup
+    # Create nominal parameters
     nominal_params = {
         "M": torch.ones(n_nodes),  # inertia constants
-        "D": 0.5 * torch.ones(n_nodes),  # damping coefficients
-        "P": 0.1 * torch.randn(n_nodes),  # small random mechanical power inputs
+        "D": torch.ones(n_nodes),  # damping coefficients
+        "P": torch.zeros(n_nodes),  # mechanical power inputs
         "K": torch.ones((n_nodes, n_nodes)),  # coupling strength matrix
     }
     
-    # Create system
+    # Create scenarios
+    scenarios = [Scenario(nominal_params)]
+    
+    # Create system with RoCoF constraints
     system = SwingEquationSystem(
         nominal_params=nominal_params,
         dt=dt,
         controller_dt=dt,
+        scenarios=scenarios,
+        max_rocof=max_rocof
     )
     
-    # Generate realistic scenarios with parameter variations
-    scenarios = system.create_realistic_scenarios(n_scenarios=5, variation=0.2)
-    
-    # Add the nominal parameters as the first scenario
-    scenarios = [nominal_params] + scenarios
+    # Create more realistic scenarios with parameter variations
+    additional_scenarios = system.create_realistic_scenarios(n_scenarios=5, variation=0.2)
+    scenarios.extend(additional_scenarios)
     
     return system, scenarios
 
@@ -106,6 +110,7 @@ def train_neural_clbf(
     hidden_size: int = 128,
     learning_rate: float = 1e-3,
     logdir: str = "logs/swing_equation_clbf",
+    barrier_weight: float = 0.5,
 ) -> NeuralCLBFController:
     """Train a neural CLBF controller for the swing equation system.
 
@@ -119,10 +124,11 @@ def train_neural_clbf(
         hidden_size: number of neurons per hidden layer
         learning_rate: learning rate for training
         logdir: directory for logging
+        barrier_weight: weight for RoCoF barrier loss
     returns:
         controller: the trained neural CLBF controller
     """
-    print("Training Neural CLBF Controller...")
+    print("Training Neural CLBF Controller with RoCoF Safety...")
     
     # Create the neural CLBF controller
     controller = NeuralCLBFController(
@@ -144,6 +150,7 @@ def train_neural_clbf(
         normalize_V_nominal=True,
         use_batch_norm=True,
         dropout_rate=0.1,
+        barrier_weight=barrier_weight,  # Add barrier weight to controller config
     )
     
     # Create callbacks
@@ -272,24 +279,24 @@ def compute_lyapunov_loss(
     actions: torch.Tensor,
     clf_lambda: float = 1.0,
     epsilon: float = 1e-5,
+    barrier_weight: float = 0.5
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the Lyapunov-based loss for behavior cloning.
     
-    This function computes the Lyapunov function decrease condition
-    for the given states and actions, ensuring safety guarantees.
-    
     args:
-        system: the swing equation system
-        expert_controller: the trained CLBF controller
-        V_fn: the trained Lyapunov function
-        states: tensor of states [batch_size, n_dims]
-        actions: tensor of actions [batch_size, n_controls]
-        clf_lambda: convergence rate parameter
-        epsilon: small constant for numerical stability
+        system: The swing equation system
+        expert_controller: The expert CLBF controller
+        V_fn: The Lyapunov function
+        states: Batch of states [batch_size, n_dims]
+        actions: Batch of actions [batch_size, n_controls]
+        clf_lambda: Convergence rate for CLF
+        epsilon: Small constant for numerical stability
+        barrier_weight: Weight for the barrier term
+    
     returns:
-        lyapunov_loss: loss based on Lyapunov decrease condition
-        violation_rate: percentage of states violating the condition
-        vdot_values: computed Vdot values for analysis
+        lyapunov_loss: The combined Lyapunov and barrier loss
+        violation_rate: Rate of Lyapunov condition violations
+        worst_vdot: Worst-case V-dot values
     """
     # Compute V(x)
     V = V_fn(states)
@@ -322,8 +329,16 @@ def compute_lyapunov_loss(
     # Compute violation rate (for monitoring)
     violation_rate = (violation > epsilon).float().mean()
     
-    # Compute loss (mean squared violation)
-    lyapunov_loss = (violation ** 2).mean()
+    # Compute CLF loss (mean squared violation)
+    clf_loss = (violation ** 2).mean()
+    
+    # Compute RoCoF barrier loss
+    barrier_values = system.get_rocof_barrier_value(states, actions)
+    barrier_violation = F.relu(-barrier_values + epsilon)
+    barrier_loss = (barrier_violation ** 2).mean()
+    
+    # Combine losses
+    lyapunov_loss = clf_loss + barrier_weight * barrier_loss
     
     return lyapunov_loss, violation_rate, worst_vdot
 
@@ -338,23 +353,21 @@ def verify_safety_constraints(
 ) -> Dict[str, float]:
     """Verify the safety constraints of the BC controller.
     
-    This function samples states randomly and checks if the BC controller
-    satisfies the Lyapunov decrease condition at those states.
-    
     args:
-        system: the swing equation system
-        controller: the BC controller to verify
-        expert_controller: the trained CLBF controller
-        V_fn: the trained Lyapunov function
-        n_samples: number of samples to check
-        clf_lambda: convergence rate parameter
-        epsilon: small constant for numerical stability
-    returns:
-        stats: dictionary with verification statistics
-    """
-    print(f"Verifying safety constraints with {n_samples} samples...")
+        system: The swing equation system
+        controller: The BC controller to verify
+        expert_controller: The expert CLBF controller
+        V_fn: The Lyapunov function
+        n_samples: Number of samples for verification
+        clf_lambda: Convergence rate for CLF
+        epsilon: Small constant for numerical stability
     
-    # Sample states randomly
+    returns:
+        stats: Dictionary of safety statistics
+    """
+    print("\nVerifying safety constraints...")
+    
+    # Generate random states within the state limits
     upper_limit, lower_limit = system.state_limits
     states = torch.rand(n_samples, system.n_dims) * (upper_limit - lower_limit) + lower_limit
     
@@ -363,24 +376,63 @@ def verify_safety_constraints(
         bc_actions = controller.u(states)
         expert_actions = expert_controller.u(states)
     
-    # Compute Lyapunov decrease for BC controller
-    bc_lyapunov_loss, bc_violation_rate, bc_vdot = compute_lyapunov_loss(
-        system, expert_controller, V_fn, states, bc_actions, clf_lambda, epsilon
-    )
+    # Compute V and V_dot for both controllers
+    with torch.no_grad():
+        V = V_fn(states)
+        Lf_V, Lg_V = expert_controller.V_lie_derivatives(states)
+        
+        # For BC controller
+        bc_vdot = torch.zeros_like(V)
+        for i in range(len(expert_controller.scenarios)):
+            bc_vdot_i = Lf_V[:, i, :] + torch.bmm(
+                Lg_V[:, i, :].unsqueeze(1), 
+                bc_actions.reshape(-1, system.n_controls, 1)
+            ).squeeze()
+            bc_vdot = torch.maximum(bc_vdot, bc_vdot_i)
+        
+        # For expert controller
+        expert_vdot = torch.zeros_like(V)
+        for i in range(len(expert_controller.scenarios)):
+            expert_vdot_i = Lf_V[:, i, :] + torch.bmm(
+                Lg_V[:, i, :].unsqueeze(1), 
+                expert_actions.reshape(-1, system.n_controls, 1)
+            ).squeeze()
+            expert_vdot = torch.maximum(expert_vdot, expert_vdot_i)
     
-    # Compute Lyapunov decrease for expert controller (as reference)
-    expert_lyapunov_loss, expert_violation_rate, expert_vdot = compute_lyapunov_loss(
-        system, expert_controller, V_fn, states, expert_actions, clf_lambda, epsilon
-    )
+    # Calculate CLF constraint violations: V_dot + lambda*V > 0
+    bc_violation = (bc_vdot + clf_lambda * V > epsilon).float().mean().item()
+    expert_violation = (expert_vdot + clf_lambda * V > epsilon).float().mean().item()
     
-    # Compute statistics
+    # Calculate RoCoF barrier violations
+    with torch.no_grad():
+        bc_rocof = system.compute_rocof(states, bc_actions)
+        expert_rocof = system.compute_rocof(states, expert_actions)
+        
+        bc_rocof_violation = (torch.abs(bc_rocof) > system.max_rocof).any(dim=1).float().mean().item()
+        expert_rocof_violation = (torch.abs(expert_rocof) > system.max_rocof).any(dim=1).float().mean().item()
+        
+        max_bc_rocof = torch.abs(bc_rocof).max().item()
+        max_expert_rocof = torch.abs(expert_rocof).max().item()
+    
+    # Calculate statistics
     stats = {
-        "bc_violation_rate": bc_violation_rate.item(),
-        "expert_violation_rate": expert_violation_rate.item(),
-        "bc_mean_vdot": bc_vdot.mean().item(),
-        "expert_mean_vdot": expert_vdot.mean().item(),
-        "action_mse": F.mse_loss(bc_actions, expert_actions).item()
+        "bc_clf_violation_rate": bc_violation,
+        "expert_clf_violation_rate": expert_violation,
+        "bc_rocof_violation_rate": bc_rocof_violation,
+        "expert_rocof_violation_rate": expert_rocof_violation,
+        "max_bc_rocof": max_bc_rocof,
+        "max_expert_rocof": max_expert_rocof,
+        "imitation_error": F.mse_loss(bc_actions, expert_actions).item(),
     }
+    
+    # Print results
+    print(f"BC controller CLF violation rate: {bc_violation:.4f}")
+    print(f"Expert controller CLF violation rate: {expert_violation:.4f}")
+    print(f"BC controller RoCoF violation rate: {bc_rocof_violation:.4f}")
+    print(f"Expert controller RoCoF violation rate: {expert_rocof_violation:.4f}")
+    print(f"Maximum BC controller RoCoF: {max_bc_rocof:.4f} Hz/s")
+    print(f"Maximum Expert controller RoCoF: {max_expert_rocof:.4f} Hz/s")
+    print(f"Imitation error (MSE): {stats['imitation_error']:.6f}")
     
     return stats
 
@@ -1464,8 +1516,13 @@ def main(args):
     np.random.seed(args.seed)
     
     # Create system and scenarios
-    system, scenarios = create_swing_system(n_nodes=args.n_nodes, dt=args.dt)
+    system, scenarios = create_swing_system(
+        n_nodes=args.n_nodes, 
+        dt=args.dt,
+        max_rocof=args.max_rocof
+    )
     print(f"Created swing equation system with {args.n_nodes} nodes")
+    print(f"RoCoF safety limit: {args.max_rocof} Hz/s")
     
     # Create datamodule
     datamodule = create_datamodule(
@@ -1497,6 +1554,7 @@ def main(args):
             hidden_size=args.clbf_hidden_size,
             learning_rate=args.clbf_lr,
             logdir=args.clbf_logdir,
+            barrier_weight=args.barrier_weight,
         )
         
         # Save the trained controller
@@ -1525,6 +1583,7 @@ def main(args):
                 hidden_size=args.clbf_hidden_size,
                 learning_rate=args.clbf_lr,
                 logdir=args.clbf_logdir,
+                barrier_weight=args.barrier_weight,
             )
     
     # Extract trained Lyapunov function
@@ -1756,6 +1815,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_nodes", type=int, default=3, help="Number of nodes in the swing equation system")
     parser.add_argument("--dt", type=float, default=0.01, help="Timestep for simulation and control")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--max_rocof", type=float, default=1.0, help="Maximum allowed Rate of Change of Frequency (Hz/s)")
+    parser.add_argument("--barrier_weight", type=float, default=0.5, help="Weight for RoCoF barrier loss in CLBF training")
     
     # CLBF parameters
     parser.add_argument("--train_clbf", action="store_true", help="Train CLBF controller even if a checkpoint exists")
