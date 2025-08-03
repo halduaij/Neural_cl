@@ -48,7 +48,14 @@ class SwingEquationSystem(ControlAffineSystem):
         self.N_DIMS = 2 * self.N_NODES - 1  # One less state due to using difference
         self.N_CONTROLS = self.N_NODES
         self.max_rocof = max_rocof  # Store maximum allowed RoCoF
+        # ------------- store nominal parameters as attributes ----------
+        self.M = torch.as_tensor(nominal_params["M"])   # (N,)
+        self.D = torch.as_tensor(nominal_params["D"])
+        self.P = torch.as_tensor(nominal_params["P"])
+        self.K = torch.as_tensor(nominal_params["K"])   # (N,N)
 
+        self.n_machines = len(self.M)       # alias used by reducers
+        self.N_NODES = self.n_machines
         self._goal_point = goal_point if goal_point is not None else torch.zeros((1, self.n_dims))
 
         super().__init__(
@@ -460,3 +467,78 @@ class SwingEquationSystem(ControlAffineSystem):
         diff = delta[:, :, None] - delta[:, None, :]
         U_pair = 0.5 * K * (1 - torch.cos(diff))
         return U_pair.sum(dim=2)
+
+
+    # ----------------------------------------------------------------- #
+    #  Global swing‑energy function  H(δ, ω)
+    # ----------------------------------------------------------------- #
+    def energy_function(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute total energy for batched state x = [θ_diff, ω].
+        θ_diff length = N-1  (angles relative to machine 1).
+        """
+        N = self.N_NODES
+        delta = torch.cat((
+            torch.zeros(x.shape[0], 1, device=x.device),  # θ_1 = 0 reference
+            x[:, : N - 1],
+        ), dim=1)                        # (B, N)
+        omega = x[:, N - 1:]             # (B, N)
+
+        # kinetic ½ ωᵀ M ω
+        H_kin = 0.5 * (self.M.to(x.device) * omega ** 2).sum(1)
+
+        # potential ½ Σ_ij K_ij (1‑cos(θ_i‑θ_j))
+        diff = delta.unsqueeze(2) - delta.unsqueeze(1)        # (B,N,N)
+        H_pot = 0.5 * (self.K.to(x.device) * (1 - torch.cos(diff))).sum((1, 2))
+
+        return H_kin + H_pot
+
+
+    # ----------------------------------------------------------------- #
+    #  Snapshot generator for model‑order reduction & OpInf
+    # ----------------------------------------------------------------- #
+    @torch.no_grad()
+    def collect_random_trajectories(
+        self,
+        N_traj: int,
+        T_steps: int = 40,
+        control_excitation: float = 0.0,
+        return_derivative: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Simulate `N_traj` open‑loop trajectories for data‑driven reduction.
+
+        Returns dict with keys 'X', 'U', and optionally 'dXdt'.
+        """
+        up, lo = self.state_limits
+        x_init = torch.rand(N_traj, self.n_dims) * (up - lo) + lo
+
+        X, U, dX = [], [], []
+        u_min, u_max = self.control_limits
+        for i in range(N_traj):
+            x = x_init[i : i + 1]
+            for _ in range(T_steps):
+                # optional random actuation
+                if control_excitation > 0:
+                    u = torch.rand(1, self.n_controls) * (u_max - u_min) + u_min
+                    u = u * control_excitation
+                else:
+                    u = torch.zeros(1, self.n_controls)
+
+                f = self._f(x, self.nominal_params)           # drift
+                g = self._g(x, self.nominal_params)
+                u_reshaped = u.view(1, self.n_controls, 1)
+                xdot = f + torch.bmm(g, u_reshaped)           # (1,n,1)
+
+                X.append(x.squeeze(0))
+                U.append(u.squeeze(0))
+                if return_derivative:
+                    dX.append(xdot.squeeze(0))
+
+                x = x + self.dt * xdot.squeeze(2)             # Euler step
+
+        out = {"X": torch.stack(X), "U": torch.stack(U)}
+        if return_derivative:
+            out["dXdt"] = torch.stack(dX)
+        return out
+
