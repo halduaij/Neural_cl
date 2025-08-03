@@ -1,12 +1,18 @@
 """
-Validation with d=19 (full dimension) to ensure 100% information retention
+Full Dimension Test with Actual Trajectory Simulation
+=====================================================
+
+Tests all reducers with d=19 (full dimension) by simulating actual trajectories
+over time and comparing full vs reduced model behavior.
 """
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 from neural_clbf.systems import SwingEquationSystem
 from neural_clbf.dimension_reduction.symplectic_projection import SymplecticProjectionReducer
 from neural_clbf.dimension_reduction.opinf import OpInfReducer
 from neural_clbf.dimension_reduction.lyap_coherency import LyapCoherencyReducer
+from neural_clbf.eval.reduction_validation import rollout_rom, validate_reducer
 
 
 def create_stable_system():
@@ -57,8 +63,8 @@ def create_stable_system():
     return sys, params
 
 
-def collect_test_data(sys, params, n_samples=100):
-    """Collect test data around equilibrium."""
+def collect_training_data(sys, params, n_samples=100):
+    """Collect training data for reducers."""
     theta_eq = sys.delta_star[0] - sys.delta_star[1:]
     omega_eq = torch.zeros(10)
     x_eq = torch.cat([theta_eq, omega_eq])
@@ -73,61 +79,108 @@ def collect_test_data(sys, params, n_samples=100):
         f = sys._f(X[i:i+1], params)
         Xdot.append(f.squeeze())
     
-    return {
-        'X': X,
-        'dXdt': torch.stack(Xdot)
-    }
+    return X, torch.stack(Xdot)
 
 
-def test_full_dimension_preservation():
-    """Test all reducers with d=19 (full dimension) for perfect reconstruction."""
+def simulate_trajectory(sys, x0, T, dt=0.01, controller=None):
+    """Simulate a trajectory using the full system dynamics."""
+    n_steps = int(T / dt)
+    
+    if controller is None:
+        controller = lambda x: torch.zeros(x.shape[0], sys.n_controls)
+    
+    # Use system's simulate method
+    traj = sys.simulate(
+        x0.unsqueeze(0) if x0.dim() == 1 else x0,
+        n_steps,
+        controller=controller,
+        controller_period=dt,
+        params=sys.nominal_params
+    )
+    
+    return traj
+
+
+def test_trajectory_preservation():
+    """Test all reducers with trajectory simulation."""
     print("="*80)
-    print("FULL DIMENSION TEST (d=19) - EXPECTING NEAR-ZERO ERRORS")
+    print("TRAJECTORY PRESERVATION TEST (d=19)")
     print("="*80)
     
     # Create system
     sys, params = create_stable_system()
-    data = collect_test_data(sys, params)
+    X_train, Xdot_train = collect_training_data(sys, params)
     
     # Energy function
-    V_fn = sys.energy_function if hasattr(sys, 'energy_function') else lambda x: 0.5 * (x ** 2).sum(dim=1)
-    V_min = V_fn(data['X']).min().item()
+    V_fn = sys.energy_function
+    V_min = V_fn(X_train).min().item()
+    
+    # Test parameters
+    T_horizon = 5.0  # 5 second simulation
+    dt = 0.001
+    n_test_trajectories = 5
     
     print(f"\nSystem: 10-generator network")
     print(f"Full dimension: 19")
-    print(f"Test data: {data['X'].shape[0]} samples")
+    print(f"Simulation horizon: {T_horizon}s")
+    print(f"Number of test trajectories: {n_test_trajectories}")
+    
+    # Sample initial conditions
+    theta_eq = sys.delta_star[0] - sys.delta_star[1:]
+    omega_eq = torch.zeros(10)
+    x_eq = torch.cat([theta_eq, omega_eq])
+    
+    x0_test = []
+    for i in range(n_test_trajectories):
+        # Different perturbation sizes
+        perturbation_scale = 0.05 * (i + 1) / n_test_trajectories
+        x0 = x_eq + perturbation_scale * torch.randn_like(x_eq)
+        x0_test.append(x0)
+    x0_test = torch.stack(x0_test)
     
     results = {}
     
-    # Test 1: Symplectic Projection (d=18 since must be even)
-    print("\n1. Testing Symplectic Projection (d=18, closest even dimension):")
+    # Test 1: Symplectic Projection (d=18)
+    print("\n1. Testing Symplectic Projection (d=18):")
     try:
         A, J, R = sys.linearise(return_JR=True)
-        spr = SymplecticProjectionReducer(A, J, R, 18)  # Must be even
+        spr = SymplecticProjectionReducer(A, J, R, 18)
         spr.full_dim = 19
         
-        # Test reconstruction
-        X_test = data['X'][:10]  # Test on 10 samples
-        Z = spr.forward(X_test)
-        X_recon = spr.inverse(Z)
+        # Simulate trajectories
+        errors = []
+        energy_errors = []
         
-        recon_error = (X_recon - X_test).norm(dim=1).mean().item()
-        
-        # Test projection matrix properties
-        P = spr.T  # Projection matrix
-        PT_P = P.T @ P
-        I_expected = torch.eye(18, device=P.device)
-        orthogonality_error = (PT_P - I_expected).norm().item()
+        for i, x0 in enumerate(x0_test):
+            # Full system trajectory
+            traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
+            
+            # Reduced system trajectory
+            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), T_horizon, dt)
+            
+            # Ensure same length
+            min_len = min(traj_full.shape[1], traj_rom.shape[1])
+            traj_full = traj_full[:, :min_len]
+            traj_rom = traj_rom[:, :min_len]
+            
+            # Trajectory error
+            traj_error = (traj_full - traj_rom).norm(dim=-1).mean().item()
+            errors.append(traj_error)
+            
+            # Energy error
+            E_full = V_fn(traj_full.reshape(-1, 19)).reshape(traj_full.shape[0], -1)
+            E_rom = V_fn(traj_rom.reshape(-1, 19)).reshape(traj_rom.shape[0], -1)
+            energy_error = (E_full - E_rom).abs().mean().item()
+            energy_errors.append(energy_error)
+            
+            print(f"   Trajectory {i+1}: error = {traj_error:.6e}, energy error = {energy_error:.6e}")
         
         results['SPR-18'] = {
-            'recon_error': recon_error,
-            'orthogonality_error': orthogonality_error,
+            'mean_traj_error': np.mean(errors),
+            'max_traj_error': np.max(errors),
+            'mean_energy_error': np.mean(energy_errors),
             'gamma': spr.gamma
         }
-        
-        print(f"   Reconstruction error: {recon_error:.6e}")
-        print(f"   Orthogonality error: {orthogonality_error:.6e}")
-        print(f"   Gamma: {spr.gamma}")
         
     except Exception as e:
         print(f"   Failed: {e}")
@@ -138,169 +191,270 @@ def test_full_dimension_preservation():
     try:
         opinf = OpInfReducer(19, 19, sys.n_controls)
         opinf.sys = sys
-        opinf.fit(data['X'], data['dXdt'], V_fn, V_min)
+        opinf.fit(X_train, Xdot_train, V_fn, V_min)
         opinf.full_dim = 19
         
-        # Test reconstruction
-        X_test = data['X'][:10]
-        Z = opinf.forward(X_test)
-        X_recon = opinf.inverse(Z)
+        errors = []
+        energy_errors = []
         
-        recon_error = (X_recon - X_test).norm(dim=1).mean().item()
-        
-        # Check projection matrix
-        P = opinf.proj
-        if P.shape[1] == 19:  # Square matrix
-            # Should be close to identity (after centering)
-            X_centered = X_test - opinf.μ
-            Z_manual = X_centered @ P
-            proj_error = (Z_manual - Z).norm().item()
-        else:
-            proj_error = float('nan')
+        for i, x0 in enumerate(x0_test):
+            # Full system trajectory
+            traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
+            
+            # Reduced system trajectory
+            traj_rom = rollout_rom(opinf, sys, x0.unsqueeze(0), T_horizon, dt)
+            
+            # Ensure same length
+            min_len = min(traj_full.shape[1], traj_rom.shape[1])
+            traj_full = traj_full[:, :min_len]
+            traj_rom = traj_rom[:, :min_len]
+            
+            # Trajectory error
+            traj_error = (traj_full - traj_rom).norm(dim=-1).mean().item()
+            errors.append(traj_error)
+            
+            # Energy error
+            E_full = V_fn(traj_full.reshape(-1, 19)).reshape(traj_full.shape[0], -1)
+            E_rom = V_fn(traj_rom.reshape(-1, 19)).reshape(traj_rom.shape[0], -1)
+            energy_error = (E_full - E_rom).abs().mean().item()
+            energy_errors.append(energy_error)
+            
+            print(f"   Trajectory {i+1}: error = {traj_error:.6e}, energy error = {energy_error:.6e}")
         
         results['OpInf-19'] = {
-            'recon_error': recon_error,
-            'projection_error': proj_error,
+            'mean_traj_error': np.mean(errors),
+            'max_traj_error': np.max(errors),
+            'mean_energy_error': np.mean(energy_errors),
             'gamma': opinf.gamma
         }
-        
-        print(f"   Reconstruction error: {recon_error:.6e}")
-        print(f"   Projection error: {proj_error:.6e}")
-        print(f"   Gamma: {opinf.gamma}")
         
     except Exception as e:
         print(f"   Failed: {e}")
         results['OpInf-19'] = {'error': str(e)}
     
-    # Test 3: Lyapunov Coherency with maximum groups
+    # Test 3: Lyapunov Coherency (k=9)
     print("\n3. Testing Lyapunov Coherency (k=9 groups → d=18):")
     try:
-        # Maximum is 9 groups (not 10, since reference machine is fixed)
-        lcr = LyapCoherencyReducer(sys, 9, data['X'])
+        lcr = LyapCoherencyReducer(sys, 9, X_train)
         lcr.full_dim = 19
         lcr.gamma = lcr.compute_gamma(V_min)
         
-        # Test reconstruction
-        X_test = data['X'][:10]
-        Z = lcr.forward(X_test)
-        X_recon = lcr.inverse(Z)
+        errors = []
+        energy_errors = []
         
-        recon_error = (X_recon - X_test).norm(dim=1).mean().item()
-        
-        # Check if P @ Pi ≈ I
-        P_Pi = lcr.P @ lcr.Pi
-        I_expected = torch.eye(P_Pi.shape[0], P_Pi.shape[1], device=P_Pi.device)
-        reconstruction_property = (P_Pi - I_expected).norm().item()
+        for i, x0 in enumerate(x0_test):
+            # Full system trajectory
+            traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
+            
+            # Reduced system trajectory
+            traj_rom = rollout_rom(lcr, sys, x0.unsqueeze(0), T_horizon, dt)
+            
+            # Ensure same length
+            min_len = min(traj_full.shape[1], traj_rom.shape[1])
+            traj_full = traj_full[:, :min_len]
+            traj_rom = traj_rom[:, :min_len]
+            
+            # Trajectory error
+            traj_error = (traj_full - traj_rom).norm(dim=-1).mean().item()
+            errors.append(traj_error)
+            
+            # Energy error
+            E_full = V_fn(traj_full.reshape(-1, 19)).reshape(traj_full.shape[0], -1)
+            E_rom = V_fn(traj_rom.reshape(-1, 19)).reshape(traj_rom.shape[0], -1)
+            energy_error = (E_full - E_rom).abs().mean().item()
+            energy_errors.append(energy_error)
+            
+            print(f"   Trajectory {i+1}: error = {traj_error:.6e}, energy error = {energy_error:.6e}")
         
         results['LCR-18'] = {
-            'recon_error': recon_error,
-            'reconstruction_property': reconstruction_property,
+            'mean_traj_error': np.mean(errors),
+            'max_traj_error': np.max(errors),
+            'mean_energy_error': np.mean(energy_errors),
             'gamma': lcr.gamma
         }
-        
-        print(f"   Reconstruction error: {recon_error:.6e}")
-        print(f"   P @ Pi - I error: {reconstruction_property:.6e}")
-        print(f"   Gamma: {lcr.gamma}")
         
     except Exception as e:
         print(f"   Failed: {e}")
         results['LCR-18'] = {'error': str(e)}
     
-    # Test 4: Identity reducer (baseline)
-    print("\n4. Testing Identity Reducer (baseline):")
-    try:
-        class IdentityReducer:
-            def __init__(self):
-                self.latent_dim = 19
-                self.full_dim = 19
-                self.gamma = 0.0
-            
-            def forward(self, x):
-                return x
-            
-            def inverse(self, z):
-                return z
-            
-            def jacobian(self, x):
-                B = x.shape[0] if x.dim() > 1 else 1
-                return torch.eye(19, device=x.device).unsqueeze(0).expand(B, -1, -1)
-        
-        identity = IdentityReducer()
-        
-        X_test = data['X'][:10]
-        Z = identity.forward(X_test)
-        X_recon = identity.inverse(Z)
-        
-        recon_error = (X_recon - X_test).norm(dim=1).mean().item()
-        
-        results['Identity'] = {
-            'recon_error': recon_error,
-            'gamma': identity.gamma
-        }
-        
-        print(f"   Reconstruction error: {recon_error:.6e} (should be exactly 0)")
-        
-    except Exception as e:
-        print(f"   Failed: {e}")
-        results['Identity'] = {'error': str(e)}
-    
-    # Summary
+    # Comprehensive validation using validate_reducer
     print("\n" + "="*80)
-    print("SUMMARY - FULL DIMENSION TEST")
-    print("="*80)
-    print("\nExpected behavior:")
-    print("- Reconstruction errors should be < 1e-10 (numerical precision)")
-    print("- Orthogonality/projection errors should be < 1e-10")
-    print("- Gamma should be small (< 1.0) for full dimension")
-    
-    print(f"\n{'Method':<15} {'Recon Error':<15} {'Other Error':<15} {'Gamma':<10} {'Status':<10}")
-    print("-"*65)
-    
-    for method, res in results.items():
-        if 'error' in res:
-            print(f"{method:<15} {'N/A':<15} {'N/A':<15} {'N/A':<10} {'FAILED':<10}")
-        else:
-            recon = f"{res['recon_error']:.2e}"
-            other = f"{res.get('orthogonality_error', res.get('projection_error', res.get('reconstruction_property', 0))):.2e}"
-            gamma = f"{res['gamma']:.3f}"
-            status = "PASS" if res['recon_error'] < 1e-6 else "FAIL"
-            print(f"{method:<15} {recon:<15} {other:<15} {gamma:<10} {status:<10}")
-    
-    # Additional dynamics test
-    print("\n" + "="*80)
-    print("DYNAMICS PRESERVATION TEST")
+    print("COMPREHENSIVE VALIDATION (50 trajectories)")
     print("="*80)
     
-    for method_name, reducer in [
-        ('OpInf-19', opinf if 'opinf' in locals() else None),
+    validation_results = {}
+    
+    for name, reducer in [
         ('SPR-18', spr if 'spr' in locals() else None),
+        ('OpInf-19', opinf if 'opinf' in locals() else None),
         ('LCR-18', lcr if 'lcr' in locals() else None)
     ]:
         if reducer is None:
             continue
             
-        print(f"\n{method_name}:")
+        print(f"\nValidating {name}:")
         try:
-            # Test if dynamics are preserved
-            x0 = data['X'][0:1]
-            z0 = reducer.forward(x0)
+            val_metrics = validate_reducer(
+                sys, reducer, 
+                n_rollouts=50,
+                horizon=2.0,  # 2 second trajectories
+                dt=0.01,
+                input_mode="zero"
+            )
             
-            # Full dynamics
-            f_full = sys._f(x0, params).squeeze()
-            
-            # Reduced dynamics (project → dynamics → reconstruct)
-            J = reducer.jacobian(x0)
-            f_reduced = J @ f_full.unsqueeze(-1)
-            f_reconstructed = reducer.inverse(f_reduced.squeeze().unsqueeze(0)).squeeze()
-            
-            dynamics_error = (f_reconstructed - f_full).norm().item()
-            print(f"   Dynamics preservation error: {dynamics_error:.6e}")
+            validation_results[name] = val_metrics
+            print(f"  Mean error: {val_metrics['mean_error']:.6e}")
+            print(f"  Max error: {val_metrics['max_error']:.6e}")
+            print(f"  Relative error: {val_metrics['relative_error']:.3%}")
+            print(f"  Energy error: {val_metrics['energy_error']:.6e}")
+            print(f"  Success rate: {val_metrics['success_rate']:.1%}")
             
         except Exception as e:
-            print(f"   Dynamics test failed: {e}")
+            print(f"  Validation failed: {e}")
     
-    return results
+    # Summary
+    print("\n" + "="*80)
+    print("SUMMARY - TRAJECTORY PRESERVATION")
+    print("="*80)
+    print("\nExpected behavior for full/near-full dimension:")
+    print("- Trajectory errors should be < 1e-6")
+    print("- Energy errors should be < 1e-8") 
+    print("- Success rate should be 100%")
+    
+    print(f"\n{'Method':<10} {'Mean Traj Err':<15} {'Max Traj Err':<15} {'Energy Err':<15} {'Success Rate':<12}")
+    print("-"*75)
+    
+    for method, res in validation_results.items():
+        if 'error' not in res:
+            mean_err = f"{res['mean_error']:.2e}"
+            max_err = f"{res['max_error']:.2e}"
+            energy_err = f"{res['energy_error']:.2e}"
+            success = f"{res['success_rate']:.1%}"
+            print(f"{method:<10} {mean_err:<15} {max_err:<15} {energy_err:<15} {success:<12}")
+    
+    # Plot some example trajectories
+    print("\n" + "="*80)
+    print("PLOTTING EXAMPLE TRAJECTORIES")
+    print("="*80)
+    
+    # Pick one initial condition for plotting
+    x0_plot = x0_test[2]  # Medium perturbation
+    
+    plt.figure(figsize=(15, 10))
+    
+    for idx, (name, reducer) in enumerate([
+        ('Full System', None),
+        ('SPR-18', spr if 'spr' in locals() else None),
+        ('OpInf-19', opinf if 'opinf' in locals() else None),
+        ('LCR-18', lcr if 'lcr' in locals() else None)
+    ]):
+        if name != 'Full System' and reducer is None:
+            continue
+            
+        # Simulate
+        if name == 'Full System':
+            traj = simulate_trajectory(sys, x0_plot, T_horizon, dt)
+        else:
+            traj = rollout_rom(reducer, sys, x0_plot.unsqueeze(0), T_horizon, dt)
+        
+        t = np.arange(traj.shape[1]) * dt
+        
+        # Plot angles (first 3)
+        plt.subplot(3, 2, 1)
+        for i in range(3):
+            plt.plot(t, traj[0, :, i].cpu().numpy(), 
+                    label=f'{name} θ_{i+2}' if idx == 0 else None,
+                    linestyle='-' if name == 'Full System' else '--')
+        plt.ylabel('Angle (rad)')
+        plt.title('Rotor Angles (first 3)')
+        if idx == 0:
+            plt.legend()
+        plt.grid(True)
+        
+        # Plot frequencies (first 3)
+        plt.subplot(3, 2, 2)
+        for i in range(3):
+            plt.plot(t, traj[0, :, 9+i].cpu().numpy(),
+                    label=f'{name} ω_{i+1}' if idx == 0 else None,
+                    linestyle='-' if name == 'Full System' else '--')
+        plt.ylabel('Frequency (rad/s)')
+        plt.title('Rotor Frequencies (first 3)')
+        if idx == 0:
+            plt.legend()
+        plt.grid(True)
+        
+        # Plot energy
+        plt.subplot(3, 2, 3)
+        E = V_fn(traj.reshape(-1, 19)).reshape(-1).cpu().numpy()
+        plt.plot(t, E, label=name, 
+                linestyle='-' if name == 'Full System' else '--')
+        plt.ylabel('Energy')
+        plt.xlabel('Time (s)')
+        plt.title('Total System Energy')
+        plt.legend()
+        plt.grid(True)
+        
+        # Plot energy error (if not full system)
+        if name != 'Full System':
+            plt.subplot(3, 2, 4)
+            traj_full = simulate_trajectory(sys, x0_plot, T_horizon, dt)
+            min_len = min(traj_full.shape[1], traj.shape[1])
+            E_full = V_fn(traj_full[:, :min_len].reshape(-1, 19)).reshape(-1).cpu().numpy()
+            E_rom = V_fn(traj[:, :min_len].reshape(-1, 19)).reshape(-1).cpu().numpy()
+            plt.semilogy(t[:min_len], np.abs(E_full - E_rom), label=name)
+            plt.ylabel('|Energy Error|')
+            plt.xlabel('Time (s)')
+            plt.title('Energy Conservation Error')
+            plt.legend()
+            plt.grid(True)
+        
+        # Plot state error norm
+        if name != 'Full System':
+            plt.subplot(3, 2, 5)
+            traj_full = simulate_trajectory(sys, x0_plot, T_horizon, dt)
+            min_len = min(traj_full.shape[1], traj.shape[1])
+            error = (traj_full[:, :min_len] - traj[:, :min_len]).norm(dim=-1).squeeze().cpu().numpy()
+            plt.semilogy(t[:min_len], error, label=name)
+            plt.ylabel('||x_full - x_rom||')
+            plt.xlabel('Time (s)')
+            plt.title('State Reconstruction Error')
+            plt.legend()
+            plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('full_dimension_trajectories.png', dpi=150)
+    print("\nTrajectory plots saved to 'full_dimension_trajectories.png'")
+    
+    return results, validation_results
 
 
 if __name__ == "__main__":
-    results = test_full_dimension_preservation()
+    results, validation_results = test_trajectory_preservation()
+    
+    # Final verdict
+    print("\n" + "="*80)
+    print("FINAL VERDICT")
+    print("="*80)
+    
+    all_passed = True
+    for method, res in validation_results.items():
+        if 'error' not in res:
+            # Check if errors are small enough
+            passed = (res['mean_error'] < 1e-4 and 
+                     res['energy_error'] < 1e-4 and
+                     res['success_rate'] > 0.95)
+            
+            status = "PASS" if passed else "FAIL"
+            print(f"{method}: {status}")
+            
+            if not passed:
+                all_passed = False
+                print(f"  - Mean error: {res['mean_error']:.6e} (threshold: 1e-4)")
+                print(f"  - Energy error: {res['energy_error']:.6e} (threshold: 1e-4)")
+                print(f"  - Success rate: {res['success_rate']:.1%} (threshold: 95%)")
+    
+    if all_passed:
+        print("\nAll reducers successfully preserve trajectories at full/near-full dimension!")
+    else:
+        print("\nSome reducers failed to preserve trajectories adequately.")
+        print("This may indicate numerical issues or implementation problems.")

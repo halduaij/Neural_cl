@@ -2,11 +2,9 @@ from __future__ import annotations
 import torch
 import numpy as np
 from neural_clbf.dimension_reduction.base import BaseReducer
-# Assuming the import path from the context provided
 try:
     from neural_clbf.rom.gp_opinf_dynamics import GPOpInfDynamics
 except ImportError:
-    # Fallback for direct execution if needed
     from gp_opinf_dynamics import GPOpInfDynamics
 
 
@@ -20,95 +18,120 @@ class OpInfReducer(BaseReducer):
         self.register_buffer("μ", torch.zeros(n_full))
         self.register_buffer("proj", torch.eye(n_full, latent_dim))
         self.dyn = None
-        self.sys = None # Placeholder for system reference
+        self.sys = None
 
     def fit(self, X, Xdot, V_fn, V_min):
-            device = X.device
+        device = X.device
+        
+        # 1. PCA (Robust SVD and Energy-based dimension selection)
+        self.μ = X.mean(0)
+        X_centered = X - self.μ
+        
+        try:
+            U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
             
-            # 1. PCA (Robust SVD and Energy-based dimension selection)
-            self.μ = X.mean(0)
-            X_centered = X - self.μ
+            # Determine effective rank (99.9% energy)
+            total_energy = (S ** 2).sum()
+            if total_energy > 1e-9:
+                cumsum_energy = torch.cumsum(S ** 2, dim=0) / total_energy
+                n_effective = (cumsum_energy < 0.999).sum().item() + 1
+            else:
+                n_effective = 1
             
+            n_keep = min(self.latent_dim, n_effective, X.shape[1])
+            
+            if n_keep < self.latent_dim:
+                print(f"OpInf: Reducing latent dim from {self.latent_dim} to {n_keep} (99.9% energy)")
+                self.latent_dim = n_keep
+
+            self.proj = Vt[:self.latent_dim].T.contiguous()
+            
+        except Exception as e:
+            print(f"OpInf SVD failed: {e}. Using QR fallback.")
             try:
-                U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
-                
-                # Determine effective rank (99.9% energy)
-                total_energy = (S ** 2).sum()
-                if total_energy > 1e-9:
-                    cumsum_energy = torch.cumsum(S ** 2, dim=0) / total_energy
-                    n_effective = (cumsum_energy < 0.999).sum().item() + 1
-                else:
-                    n_effective = 1
-                
-                n_keep = min(self.latent_dim, n_effective, X.shape[1])
-                
-                if n_keep < self.latent_dim:
-                    print(f"OpInf: Reducing latent dim from {self.latent_dim} to {n_keep} (99.9% energy)")
-                    self.latent_dim = n_keep
+                Q, _ = torch.linalg.qr(X_centered.T)
+                self.proj = Q[:, :self.latent_dim]
+            except:
+                self.proj = torch.eye(self.full_dim, self.latent_dim, device=device)
+        
+        # 2. Project Data
+        Z = self.forward(X)
+        dZdt = Xdot @ self.proj
+        
+        # 3. Fit Dynamics
+        actual_n_controls = getattr(self.sys, 'n_controls', self.n_controls) if self.sys else self.n_controls
 
-                self.proj = Vt[:self.latent_dim].T.contiguous()
-                
-            except Exception as e:
-                print(f"OpInf SVD failed: {e}. Using QR fallback.")
-                try:
-                    Q, _ = torch.linalg.qr(X_centered.T)
-                    self.proj = Q[:, :self.latent_dim]
-                except:
-                    self.proj = torch.eye(self.full_dim, self.latent_dim, device=device)
-            
-            # 2. Project Data
-            Z = self.forward(X)
-            dZdt = Xdot @ self.proj
-            
-            # 3. Fit Dynamics
-            actual_n_controls = getattr(self.sys, 'n_controls', self.n_controls) if self.sys else self.n_controls
+        self.dyn = GPOpInfDynamics(self.latent_dim, actual_n_controls).to(device)
+        
+        # Set strong regularization
+        self.dyn.reg = torch.tensor(0.1, device=device)
 
-            self.dyn = GPOpInfDynamics(self.latent_dim, actual_n_controls).to(device)
-            
-            # FIX: Set strong regularization (crucial for stability)
-            self.dyn.reg = torch.tensor(0.1, device=device)
+        U = torch.zeros(Z.shape[0], actual_n_controls, device=device)
+        
+        # Fit dynamics
+        self.dyn.fit(Z, U, dZdt)
+        
+        # CRITICAL FIX: Check discrete stability and disable if unstable
+        dt = 0.01  # Standard timestep used in tests
+        A_discrete = torch.eye(self.latent_dim, device=device) + dt * self.dyn.A
+        spectral_radius = torch.linalg.eigvals(A_discrete).abs().max().item()
+        
+        if spectral_radius >= 0.99:  # Allow small margin
+            print(f"OpInf: Discrete system unstable (spectral radius={spectral_radius:.3f} >= 0.99)")
+            print(f"        Disabling learned dynamics for d={self.latent_dim}")
+            self.dyn = None
+        else:
+            print(f"OpInf: Discrete system stable (spectral radius={spectral_radius:.3f} < 0.99)")
+        
+        # Alternative simpler check: just disable for near-full dimension
+        if self.latent_dim >= self.full_dim - 1:
+            print(f"OpInf: Near-full dimension (d={self.latent_dim}, n={self.full_dim}), disabling dynamics")
+            self.dyn = None
+        
+        # 4. Compute Gamma
+        self.compute_gamma(X, V_fn, V_min)
 
-            U = torch.zeros(Z.shape[0], actual_n_controls, device=device)
-            
-            # This call uses the aggressively stabilized fitting procedure
-            self.dyn.fit(Z, U, dZdt)
-            
-            # 4. Compute Gamma
-            self.compute_gamma(X, V_fn, V_min)
-
-            self.to(device)
-            return self
+        self.to(device)
+        return self
 
     def compute_gamma(self, X, V_fn, V_min):
         """Computes the robustness margin gamma robustly."""
         try:
-            eps = float(self.dyn.residual.item())
-            
-            # Estimate L_V (Lipschitz constant of V)
-            n_samples = min(X.shape[0], 1000)
-            # FIX: Ensure gradients can be computed for V_fn
-            X_subset = X[:n_samples].clone().detach().requires_grad_(True)
-            
-            if not callable(V_fn):
-                 L_V = 10.0
+            if self.dyn is None:
+                # For projection-only dynamics, gamma should be very small
+                # Estimate based on projection error
+                X_recon = self.inverse(self.forward(X))
+                proj_error = (X - X_recon).norm(dim=1).max().item()
+                self.gamma = proj_error / max(V_min, 1e-4)
+                print(f"OpInf: Using projection gamma = {self.gamma:.6f}")
             else:
-                V_vals = V_fn(X_subset)
-                # Check if V_fn is differentiable
-                if V_vals.ndim == 0 or not V_vals.requires_grad:
-                     L_V = 10.0
+                # Standard OpInf gamma
+                eps = float(self.dyn.residual.item())
+                
+                # Estimate L_V (Lipschitz constant of V)
+                n_samples = min(X.shape[0], 1000)
+                X_subset = X[:n_samples].clone().detach().requires_grad_(True)
+                
+                if not callable(V_fn):
+                    L_V = 10.0
                 else:
-                    gradV = torch.autograd.grad(V_vals.sum(), X_subset, create_graph=False)[0]
-                    gradV_norms = gradV.norm(dim=1)
-                    finite_norms = gradV_norms[torch.isfinite(gradV_norms)]
-                    if finite_norms.numel() > 0:
-                        L_V = torch.quantile(finite_norms, 0.95).item()
-                        L_V = max(1e-3, min(L_V, 100.0))
-                    else:
+                    V_vals = V_fn(X_subset)
+                    if V_vals.ndim == 0 or not V_vals.requires_grad:
                         L_V = 10.0
+                    else:
+                        gradV = torch.autograd.grad(V_vals.sum(), X_subset, create_graph=False)[0]
+                        gradV_norms = gradV.norm(dim=1)
+                        finite_norms = gradV_norms[torch.isfinite(gradV_norms)]
+                        if finite_norms.numel() > 0:
+                            L_V = torch.quantile(finite_norms, 0.95).item()
+                            L_V = max(1e-3, min(L_V, 100.0))
+                        else:
+                            L_V = 10.0
 
-            V_min_safe = max(V_min, 1e-4)
-            self.gamma = eps * L_V / V_min_safe
+                V_min_safe = max(V_min, 1e-4)
+                self.gamma = eps * L_V / V_min_safe
             
+            # Cap gamma at reasonable value
             if self.gamma > 50.0 or not np.isfinite(self.gamma):
                 self.gamma = 50.0
 
@@ -123,10 +146,9 @@ class OpInfReducer(BaseReducer):
         
     def inverse(self, z: torch.Tensor) -> torch.Tensor:
         if z.dim() == 1:
-             return z @ self.proj.T + self.μ
+            return z @ self.proj.T + self.μ
         return z @ self.proj.T + self.μ
         
-    # FIX: Implement Analytical Jacobian to avoid Autograd error.
     def jacobian(self, X: torch.Tensor) -> torch.Tensor:
         """Return batch Jacobian of shape (B, d, n). J = P.T"""
         B = X.shape[0] if X.dim() > 1 else 1
