@@ -348,3 +348,47 @@ class ImprovedSymplecticProjectionReducer(BaseReducer):
             trajectories = X.unsqueeze(0) if X.dim() == 2 else X
             self._apply_enhancements()
         return self
+    def enhance_with_data(self, X: torch.Tensor):
+        """Enhance projection using trajectory data."""
+        if not self.use_data:
+            return
+        
+        print("  Enhancing SPR with trajectory data...")
+        
+        X_centered = X - X.mean(0)
+
+        # Compute POD modes from data
+        try:
+            U, S, _ = torch.linalg.svd(X_centered.T, full_matrices=False)
+        except:
+            print("SVD failed during enhancement. Skipping data enhancement.")
+            return
+
+        # Take dominant POD modes (up to half the latent dim)
+        n_pod = min(self.latent_dim // 2, U.shape[1])
+        pod_modes = U[:, :n_pod]
+        
+        # Combine with original symplectic modes
+        combined = torch.cat([self._original_T, pod_modes], dim=1)
+        
+        # Orthogonalize the combined basis
+        Q, _ = torch.linalg.qr(combined)
+        
+        # FIX 3: Improved basis selection strategy.
+        # Score individual basis vectors based on the variance explained in X.
+        
+        # Project X onto the orthogonal basis Q
+        Z_Q = X_centered @ Q 
+        # Variance explained by each vector in Q
+        variance_explained = Z_Q.var(dim=0)
+        
+        # Select top modes based on variance
+        idx = torch.argsort(variance_explained, descending=True)[:self.latent_dim]
+        # Ensure indices are sorted for consistency
+        idx_sorted = torch.sort(idx).values
+        
+        T_enhanced = Q[:, idx_sorted]
+
+        # Update projection matrices using .data for correct buffer replacement
+        self.T.data = T_enhanced.detach()
+        self.Ti.data = torch.linalg.pinv(T_enhanced).detach()

@@ -25,31 +25,27 @@ class ImprovedLyapCoherencyReducer(BaseReducer):
     4. Adaptive grouping during simulation
     """
     
-    def __init__(
-        self, 
-        sys, 
-        n_groups: int, 
-        snaps: torch.Tensor, 
-        λ: float = 0.7,
-        adaptive: bool = True,
-        fuzzy_sigma: float = 0.5,
-        energy_weight: float = 0.3
-    ):
-        """
-        Initialize enhanced coherency reducer.
+    def __init__(self, sys, n_groups: int, snaps: torch.Tensor, 
+                λ: float = 0.7, fuzzy_membership: bool = True, 
+                energy_weight: float = 0.3):
         
-        Args:
-            sys: Power system object
-            n_groups: Number of coherent groups
-            snaps: Snapshot data for coherency identification
-            λ: Weight between correlation and gap (0=gap only, 1=correlation only)
-            adaptive: Enable adaptive grouping
-            fuzzy_sigma: Sigma for fuzzy membership functions
-            energy_weight: Weight for energy preservation in reconstruction
-        """
-        # Set latent dimension (2 per group: angle and frequency)
-        super().__init__(latent_dim=2 * n_groups)
+        # FIX 1: Initialize attributes BEFORE calling super().__init__
+        # This is necessary because the parent's _build method calls the overridden forward/inverse.
+        self.fuzzy_membership = fuzzy_membership
+        self.energy_weight = energy_weight
+        self._last_forward_energy = None # Initialize this storage
+
+        # Initialize parent class
+        # This will call _build, which calls the overridden forward/inverse below
+        super().__init__(sys, n_groups, snaps, λ)
         
+        # Apply enhancements (must be done after parent init as it relies on P/labels)
+        if fuzzy_membership and hasattr(self, 'labels'):
+            self._compute_fuzzy_membership(snaps)
+        
+        # Store the parent's inverse method implementation
+        self._inverse_original = super().inverse
+
         self.sys = sys
         self.n_groups = n_groups
         self.λ = λ
@@ -184,35 +180,53 @@ class ImprovedLyapCoherencyReducer(BaseReducer):
         
         return 1 - combined.cpu().numpy()
     
-    def _compute_fuzzy_membership(self, X, crisp_labels):
-        """Compute fuzzy membership functions for each machine."""
-        print("  Computing fuzzy membership functions...")
-        
+    def _compute_fuzzy_membership(self, X):
+        """Add fuzzy membership to existing grouping."""
         N = self.sys.n_machines
         device = X.device
         
-        # Compute group centers in feature space
-        features = self._extract_coherency_features(X)
+        # Use existing labels from parent (computed during super().__init__)
+        if not hasattr(self, 'labels'):
+            print("Warning: Labels not available for fuzzy membership. Skipping.")
+            return
+            
+        crisp_labels = self.labels
         
-        self.group_centers = torch.zeros(self.n_groups, features.shape[1], device=device)
+        # Compute features for each machine (Simplified feature extraction)
+        M = torch.as_tensor(self.sys.M, device=device)
+        omega = X[:, self.sys.N_NODES - 1:]
+        kin = 0.5 * M * omega ** 2
+        
+        # Features: mean and std of kinetic energy
+        features = torch.zeros(N, 2, device=device)
+        features[:, 0] = kin.mean(0)
+        features[:, 1] = kin.std(0)
+        
+        # Normalize
+        std = features.std(0)
+        std[std < 1e-6] = 1e-6 # Avoid division by zero
+        features = (features - features.mean(0)) / std
+        
+        # Compute group centers
+        group_centers = torch.zeros(self.n_groups, 2, device=device)
         for g in range(self.n_groups):
             mask = crisp_labels == g
             if mask.sum() > 0:
-                self.group_centers[g] = features[mask].mean(0)
+                group_centers[g] = features[mask].mean(0)
         
-        # Compute fuzzy membership
-        self.membership = torch.zeros(N, self.n_groups, device=device)
+        # Fuzzy membership
+        fuzzy_sigma = 0.5
+        membership = torch.zeros(N, self.n_groups, device=device)
         
         for i in range(N):
-            # Distance to each group center
-            distances = torch.norm(features[i] - self.group_centers, dim=1)
-            
-            # Gaussian membership function
-            self.membership[i] = torch.exp(-distances**2 / (2 * self.fuzzy_sigma**2))
-            
-            # Normalize
-            self.membership[i] /= self.membership[i].sum()
-    
+            distances = torch.norm(features[i] - group_centers, dim=1)
+            membership[i] = torch.exp(-distances**2 / (2 * fuzzy_sigma**2))
+            total = membership[i].sum()
+            if total > 1e-6:
+                membership[i] /= total
+        
+        self.membership = membership
+        self._rebuild_projection_fuzzy()    
     def _extract_coherency_features(self, X):
         """Extract features for coherency analysis."""
         N = self.sys.n_machines
@@ -434,18 +448,52 @@ class ImprovedLyapCoherencyReducer(BaseReducer):
     
     # Base methods
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project to latent space."""
-        # Store energy for reconstruction
+        """Store energy for reconstruction."""
+        # Store energy for later use
         if self.energy_weight > 0:
-            self.last_forward_energy = self.sys.energy_function(
-                x.unsqueeze(0) if x.dim() == 1 else x
-            )
-        
+            try:
+                if x.dim() == 1:
+                    self._last_forward_energy = self.sys.energy_function(x.unsqueeze(0))
+                else:
+                    self._last_forward_energy = self.sys.energy_function(x)
+            except Exception:
+                self._last_forward_energy = None
+
+        # Standard projection using P (inherited behavior)
         return x @ self.P
-    
+
     def inverse(self, z: torch.Tensor) -> torch.Tensor:
-        """This will be replaced by energy_preserving_inverse in __init__"""
-        return z @ self.Pi
+        """Energy-preserving reconstruction."""
+        # Standard reconstruction using Pi (inherited behavior)
+        x_base = z @ self.Pi
+        
+        # Simple energy correction (only if weight > 0 and energy stored)
+        if self.energy_weight > 0 and self._last_forward_energy is not None:
+            # Handle batch dimensions
+            if z.dim() == 1:
+                x_batch = x_base.unsqueeze(0)
+            else:
+                x_batch = x_base
+            
+            try:
+                E_recon = self.sys.energy_function(x_batch)
+                
+                # Ensure dimensions match and E_recon is valid
+                if E_recon.shape == self._last_forward_energy.shape and torch.isfinite(E_recon).all():
+                    E_error = (self._last_forward_energy - E_recon).mean()
+                    
+                    # Simple scaling correction if error is significant
+                    if abs(E_error.item()) > 1e-3:
+                        # Adjust scale slightly based on error direction
+                        # Use a small factor to avoid instability
+                        scale = 1 + self.energy_weight * 0.01 * E_error.sign()
+                        scale = max(0.98, min(1.02, scale.item()))
+                        x_base = x_base * scale
+            except Exception as e:
+                # If energy calculation fails, skip correction
+                pass
+        
+        return x_base
     
     def jacobian(self, X: torch.Tensor) -> torch.Tensor:
         """Analytical Jacobian."""
@@ -465,3 +513,27 @@ class ImprovedLyapCoherencyReducer(BaseReducer):
             print("Refitting Lyapunov Coherency with new data...")
             self._build_enhanced(X)
         return self
+        
+    def _rebuild_projection_fuzzy(self):
+        """Rebuild projection matrices with fuzzy membership."""
+        state_dim = 2 * self.sys.n_machines - 1
+        device = self.P.device
+        
+        P_fuzzy = torch.zeros(state_dim, 2 * self.n_groups, device=device)
+        
+        for g in range(self.n_groups):
+            # Angle components (weighted by membership)
+            for i in range(1, self.sys.n_machines):
+                P_fuzzy[i-1, 2*g] = self.membership[i, g]
+            
+            # Frequency components
+            for i in range(self.sys.n_machines):
+                P_fuzzy[self.sys.n_machines-1+i, 2*g+1] = self.membership[i, g]
+        
+        # Normalize columns
+        col_norms = P_fuzzy.norm(dim=0, keepdim=True)
+        P_fuzzy = P_fuzzy / (col_norms + 1e-6)
+        
+        # Update buffers using .data to manage tensor replacement correctly
+        self.P.data = P_fuzzy.detach()
+        self.Pi.data = torch.linalg.pinv(P_fuzzy).detach()
