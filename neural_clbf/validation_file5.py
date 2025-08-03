@@ -17,6 +17,10 @@ from neural_clbf.dimension_reduction.improved_lcr import ImprovedLyapCoherencyRe
 from neural_clbf.dimension_reduction.improved_opinf import ImprovedOpInfReducer
 
 # If transient_stability_validation.py is in the same folder as this script:
+from transient_stability_validation import (
+    TransientStabilityValidator, 
+    run_comprehensive_validation
+)
 
 
 def create_test_power_system():
