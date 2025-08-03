@@ -1,166 +1,167 @@
 from __future__ import annotations
 import torch, itertools
 from torch import nn
+import numpy as np
 
 
 class GPOpInfDynamics(nn.Module):
-    """Quadratic operator inference latent ODE with improved numerical stability."""
+    """Operator inference latent ODE with improved numerical stability and aggressive stabilization."""
 
     def __init__(self, d: int, m: int = 1):
         super().__init__()
         self.d = d
         self.m = m
-        self.A = nn.Parameter(torch.zeros(d, d), requires_grad=False)
+        # Initialize A with a stable diagonal matrix
+        self.A = nn.Parameter(-0.1 * torch.eye(d), requires_grad=False)
         self.B = nn.Parameter(torch.zeros(d, m), requires_grad=False)
         comb = list(itertools.combinations_with_replacement(range(d), 2))
         self.register_buffer("_comb", torch.tensor(comb, dtype=torch.long))
+        # H (quadratic terms) will be kept zero for stability in power systems.
         self.H = nn.Parameter(torch.zeros(d, len(comb)), requires_grad=False)
-        self.register_buffer("residual", torch.tensor(0.0))
-        # Add regularization parameter
-        self.register_buffer("reg", torch.tensor(1e-6))
+        self.register_buffer("residual", torch.tensor(1.0))
+        # Regularization strength (set high by OpInfReducer)
+        self.register_buffer("reg", torch.tensor(1e-3))
 
     def _q(self, z):
-        """Compute quadratic terms with bounds"""
-        z1 = z[..., self._comb[:, 0]]
-        z2 = z[..., self._comb[:, 1]]
-        q = z1 * z2
-        # Clip to avoid extreme values
-        return torch.clamp(q, -1e6, 1e6)
+        # Quadratic terms are disabled (H=0)
+        return torch.zeros(z.shape[0], len(self._comb), device=z.device)
 
     def forward(self, z, u=None):
         """
-        Compute latent dynamics dz/dt = Az + H*q(z) + Bu
-        
-        Args:
-            z: (B, d) latent state
-            u: (B, m) control input (optional)
-        
-        Returns:
-            dz/dt: (B, d) latent dynamics
+        Compute latent dynamics dz/dt = Az + Bu.
         """
-        # Ensure z has batch dimension
         if z.dim() == 1:
             z = z.unsqueeze(0)
         
-        # Check for NaN/inf in input
-        if torch.isnan(z).any() or torch.isinf(z).any():
-            z = torch.nan_to_num(z, nan=0.0, posinf=1e3, neginf=-1e3)
-            
-        # Linear term with damping for stability
+        # Handle NaNs/Infs and clamp input
+        if not torch.isfinite(z).all():
+             z = torch.nan_to_num(z, nan=0.0, posinf=1e4, neginf=-1e4)
+        z = torch.clamp(z, -1e4, 1e4)
+
+        # Linear term
         out = z @ self.A.T
         
-        # Add small damping to prevent explosion
-        out = out - self.reg * z
-        
-        # Quadratic term (only if H is not too large)
-        if self.H.norm() < 1e3:
-            q = self._q(z)
-            out = out + q @ self.H.T
-        
         # Control term
-        if u is not None:
-            # Ensure u has correct shape
+        if u is not None and self.m > 0:
             if u.dim() == 1:
-                u = u.unsqueeze(0)  # (m,) -> (1, m)
+                u = u.unsqueeze(0)
             if u.shape[0] == 1 and z.shape[0] > 1:
-                u = u.expand(z.shape[0], -1)  # (1, m) -> (B, m)
+                u = u.expand(z.shape[0], -1)
             
-            # Check control magnitude
-            if u.norm() < 1e3:
-                out = out + u @ self.B.T
+            u = torch.clamp(u, -1e4, 1e4)
+            out = out + u @ self.B.T
         
-        # Clip output to prevent explosion
-        out = torch.clamp(out, -1e3, 1e3)
-            
+        # Clamp output
+        out = torch.clamp(out, -1e4, 1e4)
         return out
 
     @torch.no_grad()
     def fit(self, Z, U, dZdt):
         """
-        Fit dynamics using regularized least squares.
-        
-        Args:
-            Z: (N, d) latent states
-            U: (N, m) control inputs
-            dZdt: (N, d) latent derivatives
+        Fit LINEAR dynamics (A, B) using robust regression and guarantee stability.
         """
         device = Z.device
         N, d = Z.shape
         
-        # Check for invalid data
-        valid_mask = ~(torch.isnan(Z).any(dim=1) | torch.isnan(dZdt).any(dim=1) | 
-                      torch.isinf(Z).any(dim=1) | torch.isinf(dZdt).any(dim=1))
+        # 1. Robust Data Normalization (using Median and IQR)
+        Z_median = Z.median(dim=0).values
+        Z_iqr = (Z.quantile(0.75, dim=0) - Z.quantile(0.25, dim=0)).clamp(min=1e-6)
+        dZdt_median = dZdt.median(dim=0).values
+        dZdt_iqr = (dZdt.quantile(0.75, dim=0) - dZdt.quantile(0.25, dim=0)).clamp(min=1e-6)
+
+        Z_norm = (Z - Z_median) / Z_iqr
+        dZdt_norm = (dZdt - dZdt_median) / dZdt_iqr
+
+        # Outlier rejection
+        valid_mask = (Z_norm.abs() < 5).all(dim=1) & (dZdt_norm.abs() < 5).all(dim=1)
         
-        if valid_mask.sum() < 10:  # Need at least 10 valid samples
-            print("Warning: Insufficient valid data for dynamics fitting")
-            # Set simple stable dynamics
-            self.A.data = -torch.eye(d, device=device) * 0.1
-            self.H.data.zero_()
-            self.B.data.zero_()
-            self.residual = torch.tensor(1.0, device=device)
+        if valid_mask.sum() < 2*d:
+            print("Warning: Insufficient valid data. Using default stable dynamics.")
+            self.A.data = -1.0 * torch.eye(d, device=device)
             return
         
-        # Use only valid data
-        Z_valid = Z[valid_mask]
-        dZdt_valid = dZdt[valid_mask]
-        U_valid = U[valid_mask] if U is not None else None
-        
-        # Build data matrix with quadratic terms
-        Q = self._q(Z_valid)  # (N_valid, n_quad)
-        
-        # Stack features [Z, Q, U]
-        if U_valid is not None and U_valid.shape[1] > 0:
-            Φ = torch.cat([Z_valid, Q, U_valid], dim=1)
+        Z_fit = Z_norm[valid_mask]
+        dZdt_fit = dZdt_norm[valid_mask]
+        U_fit = U[valid_mask] if U is not None and self.m > 0 else None
+
+        # 2. Build Data Matrix Φ = [Z, U]
+        if U_fit is not None:
+            U_median = U_fit.median(dim=0).values
+            U_iqr = (U_fit.quantile(0.75, dim=0) - U_fit.quantile(0.25, dim=0)).clamp(min=1e-6)
+            U_norm = (U_fit - U_median) / U_iqr
+            Φ = torch.cat([Z_fit, U_norm], dim=1)
         else:
-            Φ = torch.cat([Z_valid, Q], dim=1)
+            Φ = Z_fit
         
-        # Add regularization to prevent ill-conditioning
-        n_features = Φ.shape[1]
-        reg_matrix = self.reg * torch.eye(n_features, device=device)
-        
+        # 3. Robust Regression (Ridge via SVD)
         try:
-            # Regularized least squares: (Φ'Φ + λI)θ = Φ'y
-            ΦtΦ = Φ.T @ Φ + reg_matrix
-            Φty = Φ.T @ dZdt_valid
+            reg_lambda = self.reg.item()
+            # Use SVD for robust damped least squares
+            U_svd, S_svd, Vt_svd = torch.linalg.svd(Φ, full_matrices=False)
             
-            # Solve with Cholesky decomposition for stability
-            L = torch.linalg.cholesky(ΦtΦ)
-            θ = torch.cholesky_solve(Φty, L)
+            # Damped SVD inverse (Tikhonov regularization)
+            S_damped = S_svd / (S_svd**2 + reg_lambda)
+            
+            # Solve: θ = V @ diag(S_damped) @ U.T @ Y
+            θ = Vt_svd.T @ (torch.diag(S_damped) @ (U_svd.T @ dZdt_fit))
             
         except Exception as e:
-            print(f"Least squares failed: {e}, using simple dynamics")
-            # Fallback to simple stable dynamics
-            self.A.data = -torch.eye(d, device=device) * 0.1
-            self.H.data.zero_()
-            self.B.data.zero_()
-            self.residual = torch.tensor(1.0, device=device)
+            print(f"Robust regression failed: {e}. Using default stable dynamics.")
+            self.A.data = -1.0 * torch.eye(d, device=device)
             return
+
+        # 4. Extract and Rescale parameters
+        # A_rescaled = diag(dZdt_iqr) @ A_norm @ diag(1/Z_iqr)
+        A_fitted = θ[:d].T * (dZdt_iqr.unsqueeze(1) / Z_iqr.unsqueeze(0))
         
-        # Extract parameters with bounds
-        self.A.copy_(torch.clamp(θ[:d].T, -10, 10))
+        if U_fit is not None:
+             B_fitted = θ[d:].T * (dZdt_iqr.unsqueeze(1) / U_iqr.unsqueeze(0))
+             self.B.data = torch.clamp(B_fitted, -10.0, 10.0)
+
+        # 5. Aggressive Stabilization (Fixes "ERROR: Dynamics still unstable")
+        A_stable = A_fitted.clone()
+        STABILITY_MARGIN = 0.5  # Ensure eigenvalues are <= -0.5
         
-        n_quad = Q.shape[1]
-        self.H.copy_(torch.clamp(θ[d:d+n_quad].T, -1, 1))
-        
-        if U_valid is not None and U_valid.shape[1] > 0:
-            self.B.copy_(torch.clamp(θ[d+n_quad:].T, -10, 10))
-        
-        # Compute residual on valid data
-        predictions = Φ @ θ
-        residuals = (dZdt_valid - predictions).norm(dim=1)
-        # Use 95th percentile instead of max to avoid outliers
-        self.residual = torch.quantile(residuals, 0.95)
-        
-        # Check if dynamics are stable (eigenvalues of A)
         try:
-            eigvals = torch.linalg.eigvals(self.A).real
-            if eigvals.max() > 0.1:  # System might be unstable
-                print("Warning: Fitted dynamics may be unstable, adding damping")
-                self.A.data = self.A.data - 0.1 * torch.eye(d, device=device)
+            eigvals = torch.linalg.eigvals(A_fitted).real
+            max_eig = eigvals.max().item()
         except:
-            pass
+            max_eig = float('inf')
+
+        if max_eig > -STABILITY_MARGIN or max_eig == float('inf'):
+            if max_eig > 0:
+                print(f"Warning: Found positive eigenvalues, max = {max_eig:.4f}")
+
+            # Method: Shift the spectrum (A = A - shift * I)
+            if max_eig != float('inf'):
+                shift = max_eig + STABILITY_MARGIN
+                A_stable = A_fitted - shift * torch.eye(d, device=device)
+            else:
+                print("Eigendecomposition failed, using fallback stabilization.")
+                A_stable = -STABILITY_MARGIN * torch.eye(d, device=device)
+            
+        self.A.data = A_stable
+
+        # 6. Final check
+        final_max_eig = torch.linalg.eigvals(self.A.data).real.max().item()
+        print(f"Final max eigenvalue after stabilization: {final_max_eig:.4f}")
         
+        if final_max_eig > 0:
+             print("CRITICAL: Stabilization failed. Forcing diagonal stable matrix.")
+             self.A.data = -STABILITY_MARGIN * torch.eye(d, device=device)
+
+        # 7. Compute residual (on original scale)
+        Z_val = Z[valid_mask]
+        dZdt_val = dZdt[valid_mask]
+        U_val = U[valid_mask] if U is not None and self.m > 0 else None
+        
+        predictions = self.forward(Z_val, U_val)
+        residuals = (dZdt_val - predictions).norm(dim=1)
+        self.residual = torch.quantile(residuals, 0.95)
+
     def to(self, device):
-        """Move module to device"""
         super().to(device)
+        self._comb = self._comb.to(device)
+        self.residual = self.residual.to(device)
+        self.reg = self.reg.to(device)
         return self

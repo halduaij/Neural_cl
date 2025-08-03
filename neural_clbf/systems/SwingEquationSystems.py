@@ -698,3 +698,348 @@ class SwingEquationSystem(ControlAffineSystem):
                 pass
             
         return self
+        
+    """
+    Fixes for the "Jacobian is singular" error in Symplectic Projection
+    Add these methods to your SwingEquationSystem class
+    """
+
+    def linearise(self, return_JR=False):
+        """
+        Linearize the swing equation system with robust handling of singular cases.
+        
+        REPLACE or UPDATE your existing linearise method with this version
+        """
+        import torch
+        import numpy as np
+        
+        N = self.N_NODES
+        device = self.device if hasattr(self, 'device') else 'cpu'
+        
+        # First, find equilibrium point if not already computed
+        if not hasattr(self, 'delta_star') or self.delta_star is None:
+            print("Computing equilibrium point...")
+            self.delta_star = self.solve_equilibrium_robust()
+        
+        # State dimension (2N-1: N-1 angle differences + N velocities)
+        n_states = 2 * N - 1
+        
+        # Parameters
+        M = self.nominal_params['M'].to(device)
+        D = self.nominal_params['D'].to(device) 
+        K = self.nominal_params['K'].to(device)
+        
+        # Build linearized A matrix
+        A = torch.zeros(n_states, n_states, device=device)
+        
+        # Top block: d(delta)/dt = omega differences
+        # delta_1j = delta_1 - delta_j, so d(delta_1j)/dt = omega_1 - omega_j
+        for j in range(1, N):
+            A[j-1, N-1] = 1.0      # omega_1 contribution
+            A[j-1, N-1+j] = -1.0   # omega_j contribution
+        
+        # Bottom block: d(omega)/dt = -D/M * omega - coupling terms
+        # Need to compute the Jacobian of power flow
+        
+        # Try different reference machines if Jacobian is singular
+        ref_machines_to_try = [0, N//2, N-1]  # First, middle, last
+        
+        for ref_idx in ref_machines_to_try:
+            try:
+                print(f"  Trying reference machine {ref_idx}...")
+                
+                # Compute power flow Jacobian at equilibrium
+                J_power = torch.zeros(N, N, device=device)
+                
+                for i in range(N):
+                    for j in range(N):
+                        if i != j:
+                            cos_ij = torch.cos(self.delta_star[i] - self.delta_star[j])
+                            J_power[i, j] = -K[i, j] * cos_ij
+                            J_power[i, i] += K[i, j] * cos_ij
+                
+                # Remove reference machine row and column
+                indices = list(range(N))
+                indices.remove(ref_idx)
+                J_reduced = J_power[indices, :][:, indices]
+                
+                # Check if Jacobian is singular
+                det = torch.det(J_reduced)
+                cond = torch.linalg.cond(J_reduced)
+                
+                print(f"    Jacobian determinant: {det:.6f}")
+                print(f"    Jacobian condition number: {cond:.2e}")
+                
+                if abs(det) < 1e-10 or cond > 1e12:
+                    print(f"    Jacobian is singular/ill-conditioned, trying next reference...")
+                    continue
+                
+                # If we get here, Jacobian is OK
+                # Build the linearized dynamics
+                
+                # Map from angle differences to omega dynamics
+                for i in range(N):
+                    # Damping term
+                    A[N-1+i, N-1+i] = -D[i] / M[i]
+                    
+                    # Coupling terms - this is complex for swing equations
+                    # We need to map from relative angles to omega dynamics
+                    
+                    if i == ref_idx:
+                        # Reference machine
+                        for j in range(1, N):
+                            if j != ref_idx:
+                                idx = j-1 if j > ref_idx else j
+                                A[N-1+i, idx] = K[i, j] * torch.cos(self.delta_star[i] - self.delta_star[j]) / M[i]
+                    else:
+                        # Non-reference machines
+                        for j in range(N):
+                            if j != i:
+                                if j == ref_idx:
+                                    # Connection to reference
+                                    idx = i-1 if i > ref_idx else i
+                                    A[N-1+i, idx] = -K[i, j] * torch.cos(self.delta_star[i] - self.delta_star[j]) / M[i]
+                                else:
+                                    # Connection to other non-reference
+                                    idx1 = i-1 if i > ref_idx else i
+                                    idx2 = j-1 if j > ref_idx else j
+                                    if idx1 < N-1 and idx2 < N-1:
+                                        weight = K[i, j] * torch.cos(self.delta_star[i] - self.delta_star[j]) / M[i]
+                                        A[N-1+i, idx1] += weight
+                                        A[N-1+i, idx2] -= weight
+                
+                # Check stability of linearized system
+                eigvals = torch.linalg.eigvals(A)
+                max_real = eigvals.real.max().item()
+                
+                print(f"    Linearized system max eigenvalue: {max_real:.6f}")
+                
+                if max_real > 0.1:
+                    print(f"    Warning: Linearized system may be unstable")
+                
+                # If return_JR is True, compute symplectic structure matrices
+                if return_JR:
+                    # Symplectic structure matrix J
+                    J_symp = torch.zeros(n_states, n_states, device=device)
+                    # Standard form: [0, I; -I, 0] but adapted for our coordinates
+                    
+                    # Since we have [angles, velocities], we want
+                    # J such that dx/dt = J * grad H
+                    # This is non-standard due to relative angles
+                    
+                    # Top block: angles depend on velocities
+                    for i in range(N-1):
+                        J_symp[i, N-1+ref_idx] = 1.0  # Reference velocity
+                        if i < ref_idx:
+                            J_symp[i, N-1+i] = -1.0
+                        else:
+                            J_symp[i, N+i] = -1.0
+                    
+                    # Bottom block: velocities depend on angles (negative)
+                    for i in range(N):
+                        for j in range(N-1):
+                            # This is the tricky part - mapping angle differences to forces
+                            # Simplified version:
+                            if i == ref_idx:
+                                J_symp[N-1+i, j] = -1.0 / M[i]
+                            elif (i < ref_idx and j == i) or (i > ref_idx and j == i-1):
+                                J_symp[N-1+i, j] = 1.0 / M[i]
+                    
+                    # Dissipation matrix R
+                    R = torch.zeros(n_states, n_states, device=device)
+                    for i in range(N):
+                        R[N-1+i, N-1+i] = D[i]
+                    
+                    print(f"  ✓ Linearization successful with reference machine {ref_idx}")
+                    return A, J_symp, R
+                else:
+                    print(f"  ✓ Linearization successful with reference machine {ref_idx}")
+                    return A
+                    
+            except Exception as e:
+                print(f"    Failed with reference {ref_idx}: {e}")
+                continue
+        
+        # If all references failed, try a different approach
+        print("  All reference machines failed. Trying alternative linearization...")
+        
+        # Alternative: Use a pseudo-inverse approach
+        try:
+            # Build full system Jacobian (without removing reference)
+            A_full = torch.zeros(2*N, 2*N, device=device)
+            
+            # Simple structure
+            A_full[:N, N:] = torch.eye(N, device=device)  # d(delta)/dt = omega
+            
+            # Power flow linearization
+            for i in range(N):
+                A_full[N+i, N+i] = -D[i] / M[i]  # Damping
+                
+                for j in range(N):
+                    if i != j:
+                        cos_ij = torch.cos(self.delta_star[i] - self.delta_star[j])
+                        A_full[N+i, j] = -K[i, j] * cos_ij / M[i]
+                        A_full[N+i, i] += K[i, j] * cos_ij / M[i]
+            
+            # Project to reduced space (remove one angle)
+            # Use SVD to find the best projection
+            U, S, Vt = torch.linalg.svd(A_full[:, :N])
+            
+            # Keep N-1 most significant directions
+            P = Vt[1:N, :].T  # Projection matrix
+            
+            # Build reduced A matrix
+            A_reduced = torch.zeros(n_states, n_states, device=device)
+            
+            # Project the dynamics
+            A_reduced[:N-1, :N-1] = P.T @ A_full[:N, :N] @ P
+            A_reduced[:N-1, N-1:] = P.T @ A_full[:N, N:]
+            A_reduced[N-1:, :N-1] = A_full[N:, :N] @ P
+            A_reduced[N-1:, N-1:] = A_full[N:, N:]
+            
+            if return_JR:
+                # Approximate J and R matrices
+                J_symp = torch.zeros(n_states, n_states, device=device)
+                # Block structure
+                J_symp[:N-1, N-1:] = P.T
+                J_symp[N-1:, :N-1] = -P
+                
+                R = torch.zeros(n_states, n_states, device=device)
+                R[N-1:, N-1:] = torch.diag(D)
+                
+                print("  ✓ Alternative linearization successful")
+                return A_reduced, J_symp, R
+            else:
+                print("  ✓ Alternative linearization successful")
+                return A_reduced
+                
+        except Exception as e:
+            raise RuntimeError(f"All linearization attempts failed: {e}")
+
+
+    def solve_equilibrium_robust(self, max_iter=1000, tol=1e-8):
+        """
+        Robust equilibrium solver that handles difficult cases.
+        
+        ADD this method to your SwingEquationSystem if you don't have it
+        """
+        import torch
+        
+        N = self.N_NODES
+        device = self.device if hasattr(self, 'device') else 'cpu'
+        
+        # Get parameters
+        P = self.nominal_params['P'].to(device)
+        K = self.nominal_params['K'].to(device)
+        
+        # Check power balance
+        P_sum = P.sum()
+        if abs(P_sum) > 1e-6:
+            print(f"Warning: Power imbalance = {P_sum:.6f}. Adjusting...")
+            P = P - P_sum / N
+            self.nominal_params['P'] = P
+        
+        # Multiple initial guesses
+        initial_guesses = []
+        
+        # Guess 1: All zeros
+        initial_guesses.append(torch.zeros(N, device=device))
+        
+        # Guess 2: DC power flow
+        try:
+            # Build DC power flow B matrix
+            B = torch.zeros(N, N, device=device)
+            for i in range(N):
+                for j in range(N):
+                    if i != j:
+                        B[i, j] = -K[i, j]
+                        B[i, i] += K[i, j]
+            
+            # Remove reference (node 0)
+            B_red = B[1:, 1:]
+            P_red = P[1:]
+            
+            # Solve DC power flow
+            delta_red = torch.linalg.solve(B_red, P_red)
+            delta_dc = torch.zeros(N, device=device)
+            delta_dc[1:] = delta_red
+            initial_guesses.append(delta_dc)
+        except:
+            pass
+        
+        # Guess 3: Small random perturbation
+        initial_guesses.append(0.1 * torch.randn(N, device=device))
+        
+        # Try each initial guess
+        best_delta = None
+        best_error = float('inf')
+        
+        for guess_idx, delta_init in enumerate(initial_guesses):
+            delta = delta_init.clone()
+            
+            # Newton-Raphson with line search
+            for iteration in range(max_iter):
+                # Compute power mismatch
+                P_calc = torch.zeros(N, device=device)
+                for i in range(N):
+                    for j in range(N):
+                        if i != j:
+                            P_calc[i] += K[i, j] * torch.sin(delta[i] - delta[j])
+                
+                mismatch = P - P_calc
+                error = mismatch.norm()
+                
+                if error < tol:
+                    print(f"  Converged with guess {guess_idx} in {iteration} iterations")
+                    return delta
+                
+                if error < best_error:
+                    best_error = error
+                    best_delta = delta.clone()
+                
+                # Jacobian
+                J = torch.zeros(N, N, device=device)
+                for i in range(N):
+                    for j in range(N):
+                        if i != j:
+                            cos_ij = torch.cos(delta[i] - delta[j])
+                            J[i, j] = -K[i, j] * cos_ij
+                            J[i, i] += K[i, j] * cos_ij
+                
+                # Remove reference
+                J_red = J[1:, 1:]
+                mismatch_red = mismatch[1:]
+                
+                try:
+                    # Add regularization if needed
+                    if torch.linalg.cond(J_red) > 1e10:
+                        J_red += 1e-6 * torch.eye(N-1, device=device)
+                    
+                    d_delta_red = torch.linalg.solve(J_red, mismatch_red)
+                    
+                    # Line search
+                    alpha = 1.0
+                    for _ in range(10):
+                        delta_new = delta.clone()
+                        delta_new[1:] += alpha * d_delta_red
+                        
+                        # Check new error
+                        P_calc_new = torch.zeros(N, device=device)
+                        for i in range(N):
+                            for j in range(N):
+                                if i != j:
+                                    P_calc_new[i] += K[i, j] * torch.sin(delta_new[i] - delta_new[j])
+                        
+                        error_new = (P - P_calc_new).norm()
+                        
+                        if error_new < error:
+                            delta = delta_new
+                            break
+                        else:
+                            alpha *= 0.5
+                            
+                except:
+                    break
+        
+        print(f"  Warning: Did not fully converge. Best error = {best_error:.2e}")
+        return best_delta

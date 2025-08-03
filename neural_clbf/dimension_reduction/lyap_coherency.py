@@ -92,11 +92,10 @@ class LyapCoherencyReducer(BaseReducer):
         return z @ self.Pi
     
     def jacobian(self, X: torch.Tensor) -> torch.Tensor:
-        """Return batch Jacobian of shape (B, d, n)"""
+        """Return batch Jacobian of shape (B, d, n). Analytical: J = P.T"""
         B = X.shape[0]
         # P.T has shape (d, n), expand to (B, d, n)
-        return self.P.T.unsqueeze(0).expand(B, -1, -1)
-
+        return self.P.T.unsqueeze(0).expand(B, -1, -1).contiguous()
     def compute_gamma(self, V_min: float) -> float:
         """Compute the Lyapunov robustness margin gamma."""
         return float(self.deltaV_max.item() / V_min) if V_min > 0 else float('inf')
