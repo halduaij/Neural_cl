@@ -43,11 +43,11 @@ def rollout_rom(
 
     Returns
     -------
-    x_rec  : reconstructed trajectory  (batch, T, n)
+    x_rec  : reconstructed trajectory  (batch, T+1, n) including initial state
     """
     B, n = x0.shape
     T = int(horizon / dt)
-    z = reducer(x0)                                   # initial latent
+    z = reducer.forward(x0)                           # initial latent
     traj = [reducer.inverse(z)]                       # store full‑state
 
     for _ in range(T):
@@ -66,9 +66,17 @@ def rollout_rom(
             z_dot = reducer.dyn.forward(z, u)
         elif hasattr(sys, "_f"):                      # projected f
             x_full = reducer.inverse(z)
-            z_dot = reducer.jacobian(x_full).bmm(
-                sys._f(x_full, params=sys.nominal_params).unsqueeze(2)
-            ).squeeze(2)
+            
+            # Get f(x) - should be (B, n_dims, 1)
+            f_x = sys._f(x_full, params=sys.nominal_params)
+            
+            # Get Jacobian - should be (B, d, n)
+            J = reducer.jacobian(x_full)
+            
+            # Compute z_dot = J @ f(x)
+            # J is (B, d, n), f_x is (B, n, 1)
+            # Use batch matrix multiply
+            z_dot = torch.bmm(J, f_x).squeeze(-1)  # (B, d)
         else:
             raise RuntimeError("Reducer lacks latent dynamics")
 
@@ -90,15 +98,16 @@ def validate_reducer(
     dt: float = 0.01,
     input_mode: str = "zero",
     device: str = "cpu",
-) -> Dict[str, float]:
+) -> Dict[str, torch.Tensor]:
     """
     Simulate `n_rollouts` random initial conditions both with the full
     model and with the reduced model, then compute error metrics.
 
     Returns a dict with:
-        mse_traj       mean‑squared state error over entire rollout
-        max_state_err  worst‑case ‖x‑x̂‖∞
-        energy_drift   max |H(x̂) - H(x)| / H(x)
+        mean_error     mean trajectory error
+        max_error      maximum trajectory error
+        relative_error relative error (mean/mean_norm)
+        energy_error   energy conservation error
         latent_dim     reducer.latent_dim
         gamma          reducer.gamma
     """
@@ -110,30 +119,40 @@ def validate_reducer(
     x0 = torch.rand(n_rollouts, sys.n_dims, device=device) * (up - lo) + lo
 
     # --- ground truth trajectory -------------------------------------- #
+    # Fix: simulate returns tensor, not dict
     full_traj = sys.simulate(
-        x0, int(horizon / dt), u=None,            # u=None ⇒ open‑loop
+        x0, 
+        int(horizon / dt), 
+        controller=None,  # Use None or sys.u_nominal
         controller_period=dt,
         params=sys.nominal_params,
-    )["x"]                                         # (B,T+1,n)
+    )  # Should be (B,T+1,n)
 
     # --- ROM trajectory ------------------------------------------------ #
     rom_traj = rollout_rom(
         reducer, sys, x0, horizon, dt, input_mode=input_mode
-    ).to(device)                                   # (B,T+1,n)
+    ).to(device)  # (B,T+1,n)
 
     # --- metrics ------------------------------------------------------- #
-    mse_traj = ((full_traj - rom_traj) ** 2).mean().item()
-    max_state_err = (full_traj - rom_traj).abs().max().item()
-
+    # Trajectory errors
+    errors = (full_traj - rom_traj).norm(dim=-1)  # (B, T+1)
+    mean_error = errors.mean()
+    max_error = errors.max()
+    
+    # Relative error
+    full_norm = full_traj.norm(dim=-1).mean()
+    relative_error = mean_error / (full_norm + 1e-12)
+    
+    # Energy conservation
     H_full = sys.energy_function(full_traj.reshape(-1, sys.n_dims))
-    H_rom  = sys.energy_function(rom_traj.reshape(-1, sys.n_dims))
-    rel_err = (H_full - H_rom).abs() / (H_full + 1e-12)
-    energy_drift = rel_err.max().item()
+    H_rom = sys.energy_function(rom_traj.reshape(-1, sys.n_dims))
+    energy_error = (H_full - H_rom).abs().mean()
 
     return {
+        "mean_error": mean_error,
+        "max_error": max_error,
+        "relative_error": relative_error,
+        "energy_error": energy_error,
         "latent_dim": reducer.latent_dim,
         "gamma": getattr(reducer, "gamma", 0.0),
-        "mse_traj": mse_traj,
-        "max_state_err": max_state_err,
-        "energy_rel_error": energy_drift,
     }

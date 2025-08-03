@@ -77,7 +77,7 @@ class SwingEquationSystem(ControlAffineSystem):
     @property
     def K(self):
         """Return the coupling matrix (for backward compatibility)"""
-        return self.B_matrix  # FIXED: return B_matrix, not self
+        return self.B_matrix
     
     def compute_linearized_controller(self, scenarios: Optional[ScenarioList] = None):
         """
@@ -96,8 +96,24 @@ class SwingEquationSystem(ControlAffineSystem):
         The validation passes u as a keyword argument, which the parent doesn't accept.
         This method extracts u, converts it to a controller, and calls parent's simulate.
         """
+        # Ensure num_steps is an integer (fix for the string error)
+        try:
+            num_steps = int(num_steps)
+        except (ValueError, TypeError) as e:
+            raise TypeError(f"num_steps must be convertible to int, got {type(num_steps).__name__}: {num_steps}")
+        
         # Extract u if provided
         u = kwargs.pop('u', None)
+        
+        # Extract other expected kwargs for parent's simulate
+        controller_period = kwargs.pop('controller_period', None)
+        guard = kwargs.pop('guard', None)
+        params = kwargs.pop('params', None)
+        
+        # Check if there are any unexpected kwargs remaining
+        if kwargs:
+            unexpected = list(kwargs.keys())
+            print(f"Warning: Unexpected keyword arguments will be ignored: {unexpected}")
         
         # Handle controller - either from args or create from u
         if len(args) >= 1:
@@ -107,6 +123,13 @@ class SwingEquationSystem(ControlAffineSystem):
         else:
             # No positional controller, check if we have u
             if u is not None:
+                # Ensure u is a tensor, not a string or other type
+                if not isinstance(u, torch.Tensor):
+                    try:
+                        u = torch.tensor(u, dtype=torch.float32)
+                    except Exception as e:
+                        raise TypeError(f"Could not convert u to tensor: {e}")
+                
                 # Create controller from u
                 timestep_counter = {'t': 0}
                 
@@ -127,8 +150,22 @@ class SwingEquationSystem(ControlAffineSystem):
                 controller = self.u_nominal
             remaining_args = ()
         
-        # Call parent's simulate - FIXED: removed .B_matrix at the end
-        return super().simulate(x_init, num_steps, controller, *remaining_args, **kwargs)
+        # Validate x_init
+        if not isinstance(x_init, torch.Tensor):
+            try:
+                x_init = torch.tensor(x_init, dtype=torch.float32)
+            except Exception as e:
+                raise TypeError(f"Could not convert x_init to tensor: {e}")
+        
+        # Call parent's simulate with only the parameters it expects
+        return super().simulate(
+            x_init, 
+            num_steps, 
+            controller, 
+            controller_period=controller_period,
+            guard=guard,
+            params=params
+        )
 
     def validate_params(self, params: Scenario) -> bool:
         """

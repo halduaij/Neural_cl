@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch, numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
-from .base import BaseReducer
+from neural_clbf.dimension_reduction.base import BaseReducer
 
 
 class LyapCoherencyReducer(BaseReducer):
@@ -14,7 +14,7 @@ class LyapCoherencyReducer(BaseReducer):
 
     def _build(self, X, λ):
         N = self.sys.n_machines
-        M = torch.as_tensor(self.sys.M, dtype=X.dtype)
+        M = torch.as_tensor(self.sys.M, dtype=X.dtype, device=X.device)
 
         # Debug prints
         print(f"[DEBUG LyapCoherency] X.shape = {X.shape}, N = {N}")
@@ -38,13 +38,13 @@ class LyapCoherencyReducer(BaseReducer):
         # Compute correlation and gap matrices
         corr = torch.corrcoef(E.T).detach().cpu().numpy()
         gap = (E[:, :, None] - E[:, None, :]).abs().max(0).values
-        gap = (gap / gap.max()).detach().numpy()
+        gap = (gap / gap.max()).detach().cpu().numpy()
         D = λ * (1 - np.abs(corr)) + (1 - λ) * gap
 
         # Hierarchical clustering
         Z = linkage(D[np.triu_indices(N, 1)], "average")
         labels = fcluster(Z, t=self.n_groups, criterion="maxclust") - 1
-        labels = torch.as_tensor(labels, dtype=torch.long)
+        labels = torch.as_tensor(labels, dtype=torch.long, device=X.device)
 
         # Build projection matrix P
         # Since state is [θ_12, ..., θ_1n, ω_1, ..., ω_n], we need dimension 2N-1
@@ -79,14 +79,32 @@ class LyapCoherencyReducer(BaseReducer):
         print(f"[DEBUG LyapCoherency] P.shape = {P.shape}, Pi.shape = {self.Pi.shape}")
         print(f"[DEBUG LyapCoherency] deltaV_max = {self.deltaV_max.item()}")
 
-    fit = lambda self, x: self
-    forward = lambda self, x: x @ self.P
-    inverse = lambda self, z: z @ self.Pi
+    def fit(self, x):
+        """No-op for this reducer"""
+        return self
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project to latent space"""
+        return x @ self.P
+        
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        """Reconstruct from latent space"""
+        return z @ self.Pi
     
-    def jacobian(self, X):
+    def jacobian(self, X: torch.Tensor) -> torch.Tensor:
+        """Return batch Jacobian of shape (B, d, n)"""
         B = X.shape[0]
-        return self.P.T.unsqueeze(0).expand(B, *self.P.T.shape)
+        # P.T has shape (d, n), expand to (B, d, n)
+        return self.P.T.unsqueeze(0).expand(B, -1, -1)
 
-    def compute_gamma(self, V_min):
+    def compute_gamma(self, V_min: float) -> float:
         """Compute the Lyapunov robustness margin gamma."""
         return float(self.deltaV_max.item() / V_min) if V_min > 0 else float('inf')
+        
+    def to(self, device):
+        """Move reducer to device"""
+        self.P = self.P.to(device)
+        self.Pi = self.Pi.to(device)
+        self.labels = self.labels.to(device)
+        self.deltaV_max = self.deltaV_max.to(device)
+        return self

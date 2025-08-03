@@ -7,7 +7,7 @@ BaseReducer
 
 • Handles:
     – storing ``latent_dim`` (d) and, optionally, ``full_dim`` (n),
-    – a default γ attribute (Lyapunov robust‑margin, 0 if exact),
+    – a default γ attribute (Lyapunov robust‑margin, 0 if exact),
     – an autograd‑based fallback for the batch Jacobian.
 
 Sub‑classes **must** implement
@@ -31,7 +31,7 @@ class BaseReducer(nn.Module):
     Parameters
     ----------
     latent_dim : int
-        Dimension d of the reduced / latent state.
+        Dimension d of the reduced / latent state.
     """
 
     def __init__(self, latent_dim: int):
@@ -50,6 +50,10 @@ class BaseReducer(nn.Module):
 
     def inverse(self, Z: torch.Tensor) -> torch.Tensor:          # z → x̂
         raise NotImplementedError("Reducer must implement inverse()")
+        
+    def __call__(self, X: torch.Tensor) -> torch.Tensor:
+        """Make reducer callable - just calls forward"""
+        return self.forward(X)
 
     # Optional: fit is a no‑op by default (analytic reducers)
     def fit(self, X: torch.Tensor, *args, **kwargs):
