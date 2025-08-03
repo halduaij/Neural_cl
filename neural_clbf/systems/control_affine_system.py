@@ -472,7 +472,7 @@ class ControlAffineSystem(ABC):
         # Compute controller update frequency
         if controller_period is None:
             controller_period = self.dt
-        controller_update_freq = int(controller_period / self.dt)
+        controller_update_freq = max(1, int(controller_period / self.dt))
 
         # Run the simulation until it's over or an error occurs
         t_sim_final = 0

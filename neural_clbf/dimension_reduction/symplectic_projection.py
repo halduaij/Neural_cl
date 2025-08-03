@@ -27,7 +27,7 @@ class SymplecticProjectionReducer(BaseReducer):
         
         # Build the projection
         self._build_projection(A, J, R, X_data)
-
+   
     def _build_projection(self, A, J, R, X_data=None):
         """Build improved projection matrix."""
         device = A.device
@@ -39,91 +39,102 @@ class SymplecticProjectionReducer(BaseReducer):
         Eye_np = torch.eye(n_full, device=A.device).cpu().numpy()
         
         try:
-            # Solve CARE: Aᵀ P + P A + Q = 0 with Q = I
-            P_np, _, _ = care(A_np.T, Eye_np, Eye_np, Eye_np)
+            # Use better Q matrix - weight important states more
+            Q_np = Eye_np.copy()
+            # Weight angle states higher (first n-1 states)
+            for i in range(min(9, n_full)):  # Assuming 9 angle states
+                Q_np[i, i] = 10.0
+                
+            P_np, _, _ = care(A_np.T, Eye_np, Q_np, Eye_np)
             P = torch.as_tensor(P_np, dtype=dtype, device=device)
         except Exception as e:
             print(f"Warning: CARE solver failed: {e}. Using fallback.")
             P = torch.eye(n_full, device=device, dtype=dtype)
         
-        # Step 2: Compute eigenvectors of P (these are good candidates)
+        # Step 2: Compute eigenvectors of P
         eigvals, eigvecs = torch.linalg.eigh(P)
         
-        # Sort by eigenvalue magnitude (most important modes first)
-        idx = torch.argsort(eigvals.abs(), descending=True)
-        eigvecs = eigvecs[:, idx]
-        eigvals = eigvals[idx]
-        
-        if self.enhanced and X_data is not None:
-            # Step 3: Enhance with data-driven modes
-            print("Enhancing SPR with data-driven modes...")
+        # Step 3: If we have training data, use it to select best modes
+        if X_data is not None and X_data.shape[0] > 0:
+            print("  Using data-driven mode selection...")
             
             # Compute POD modes from data
-            X_mean = X_data.mean(0)
-            X_centered = X_data - X_mean
-            U_svd, S_svd, Vt_svd = torch.linalg.svd(X_centered.T, full_matrices=False)
+            X_centered = X_data - X_data.mean(0)
+            U_pod, S_pod, _ = torch.linalg.svd(X_centered.T, full_matrices=False)
             
-            # Combine symplectic and POD modes
-            combined_modes = torch.cat([eigvecs, U_svd[:, :10]], dim=1)  # Add top 10 POD modes
+            # Combine symplectic eigenvectors and POD modes
+            combined_modes = torch.cat([eigvecs, U_pod[:, :10]], dim=1)
             
             # Orthogonalize
             Q_combined, _ = torch.linalg.qr(combined_modes)
             
-            # Score each mode based on:
-            # 1. Preservation of symplectic structure
-            # 2. Data reconstruction error
-            # 3. Energy preservation
-            scores = self._score_modes(Q_combined, J, X_data)
+            # Score each mode
+            scores = []
+            x_eq = X_data[0]  # Use first point as reference
             
-            # Select top scoring modes
-            idx_best = torch.argsort(scores, descending=True)[:self.latent_dim]
-            T = Q_combined[:, idx_best]
+            for i in range(Q_combined.shape[1]):
+                mode = Q_combined[:, i:i+1]
+                
+                # Reconstruction score on training data
+                proj_data = X_centered @ mode @ mode.T
+                recon_error = (X_centered - proj_data).norm() / X_centered.norm()
+                
+                # Energy preservation score
+
+                if x_eq.dim() == 1:
+                    x_eq_batch = x_eq.unsqueeze(0)
+                else:
+                    x_eq_batch = x_eq
+                x_proj = x_eq_batch @ self.T  # Project first
+                x_recon = x_proj @ self.Ti     # Then reconstruct
+                error = (x_recon - x_eq_batch).norm()
+
+                energy_error = x_proj.norm() / x_eq.norm()
+                
+                # Combined score (lower is better)
+                score = recon_error + 0.5 * energy_error
+                scores.append(score.item())
+            
+            # Select best modes
+            scores = torch.tensor(scores)
+            best_indices = torch.argsort(scores)[:self.latent_dim]
+            best_indices = torch.sort(best_indices).values
+            
+            self.T = Q_combined[:, best_indices]
             
         else:
-            # Standard approach: use top eigenvectors
-            T = eigvecs[:, :self.latent_dim]
+            # No data - use standard approach
+            if n_full == 19 and self.latent_dim == 18:
+                print("  Optimizing 19D -> 18D reduction...")
+                idx = torch.argsort(eigvals.abs(), descending=True)[:18]
+                self.T = eigvecs[:, idx]
+            else:
+                idx = torch.argsort(eigvals.abs(), descending=True)
+                self.T = eigvecs[:, idx[:self.latent_dim]]
         
-        # Step 4: Optimize the basis specifically for minimal reconstruction error
-        if n_full == 19 and self.latent_dim == 18:
-            # Special handling for 19D -> 18D
-            print("Optimizing basis for 19D -> 18D reduction...")
-            
-            # Find the least important direction to drop
-            if X_data is not None:
-                # Use data to find least important direction
-                X_cov = (X_data - X_data.mean(0)).T @ (X_data - X_data.mean(0)) / X_data.shape[0]
-                eig_data, vec_data = torch.linalg.eigh(X_cov)
-                
-                # The eigenvector with smallest eigenvalue is least important
-                least_important_dir = vec_data[:, 0]
-                
-                # Build projection that's orthogonal to least important direction
-                # This minimizes information loss
-                I_proj = torch.eye(n_full, device=device) - torch.outer(least_important_dir, least_important_dir)
-                T_opt = I_proj @ T
-                
-                # Re-orthogonalize
-                T, _ = torch.linalg.qr(T_opt)
-                T = T[:, :self.latent_dim]
+        # Step 4: Improve conditioning
+        self.T = self.T + 1e-8 * torch.randn_like(self.T)
+        self.T, _ = torch.linalg.qr(self.T)
         
-        # Step 5: Final symplectic structure preservation (if possible)
-        # For even dimensions, ensure symplectic pairing
-        if self.latent_dim % 2 == 0:
-            T = self._enforce_symplectic_structure(T, J)
+        # Step 5: Compute pseudo-inverse with regularization
+        regularization = 1e-10
+        self.Ti = self.T.T @ torch.linalg.inv(
+            self.T @ self.T.T + regularization * torch.eye(self.latent_dim, device=device)
+        )
         
-        # Store the projection matrices
-        self.register_buffer("T", T)
-        
-        # Compute optimal pseudo-inverse
-        # For non-square matrices, we want the Moore-Penrose pseudo-inverse
-        self.register_buffer("Ti", torch.linalg.pinv(T))
+        # Register buffers
+        self.register_buffer("T", self.T)
+        self.register_buffer("Ti", self.Ti)
         
         # Set gamma
-        self.gamma = 0.0  # Will be updated if data is provided
+        self.gamma = 0.0
         
-        # Compute actual gamma if we have data
-        if X_data is not None:
-            self._compute_empirical_gamma(X_data)
+        # Print diagnostics
+        print(f"  SPR projection matrix condition number: {torch.linalg.cond(self.T):.2e}")
+        proj_error = torch.norm(self.T @ self.Ti @ self.T - self.T)
+        print(f"  Projection property error: {proj_error:.2e}")
+
+    
 
     def _score_modes(self, modes, J, X_data):
         """Score modes based on multiple criteria."""

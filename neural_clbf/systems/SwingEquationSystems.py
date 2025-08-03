@@ -48,14 +48,14 @@ class SwingEquationSystem(ControlAffineSystem):
         self.N_DIMS = 2 * self.N_NODES - 1  # One less state due to using difference
         self.N_CONTROLS = self.N_NODES
         self.max_rocof = max_rocof  # Store maximum allowed RoCoF
-        
         # Store parameters with different names to avoid conflict with parent class
         # Parent class uses self.P for Lyapunov matrix and self.K for controller gain
         self.M_inertia = torch.as_tensor(nominal_params["M"])   # (N,)
         self.D_damping = torch.as_tensor(nominal_params["D"])
         self.P_mechanical = torch.as_tensor(nominal_params["P"])
         self.B_matrix = torch.as_tensor(nominal_params["K"])   # (N,N) - coupling matrix
-        
+        if controller_dt is None:
+            controller_dt = dt  # Use the parameter directly, not self.dt        
         # Create aliases for backward compatibility
         self.M = self.M_inertia
         self.D = self.D_damping

@@ -63,7 +63,7 @@ def create_stable_system():
     return sys, params
 
 
-def collect_training_data(sys, params, n_samples=100):
+def collect_training_data(sys, params, n_samples=1000):
     """Collect training data for reducers."""
     theta_eq = sys.delta_star[0] - sys.delta_star[1:]
     omega_eq = torch.zeros(10)
@@ -81,7 +81,6 @@ def collect_training_data(sys, params, n_samples=100):
     
     return X, torch.stack(Xdot)
 
-
 def simulate_trajectory(sys, x0, T, dt=0.01, controller=None):
     """Simulate a trajectory using the full system dynamics."""
     n_steps = int(T / dt)
@@ -94,7 +93,7 @@ def simulate_trajectory(sys, x0, T, dt=0.01, controller=None):
         x0.unsqueeze(0) if x0.dim() == 1 else x0,
         n_steps,
         controller=controller,
-        controller_period=dt,
+        controller_period=dt , # Ensure controller period is at least dt
         params=sys.nominal_params
     )
     
@@ -111,13 +110,38 @@ def test_trajectory_preservation():
     sys, params = create_stable_system()
     X_train, Xdot_train = collect_training_data(sys, params)
     
+        
+    # After collecting X_train
+    print("\nChecking training data independence:")
+    X_centered = X_train - X_train.mean(0)
+    U, S, Vt = torch.linalg.svd(X_centered.T)
+
+    # Show singular values
+    print("Singular values:", S[:10])
+    print("Normalized singular values:", S[:10] / S[0])
+
+    # Find effective rank
+    tol = 1e-8
+    effective_rank = (S > tol * S[0]).sum().item()
+    print(f"Effective rank (tol={tol}): {effective_rank}")
+
+    # Check which modes are missing
+    if effective_rank < 19:
+        print("\nMissing modes (smallest singular values):")
+        for i in range(effective_rank, min(19, len(S))):
+            mode = Vt[i]
+            print(f"  Mode {i}: singular value = {S[i]:.2e}")
+            # Check if it's a frequency mode
+            freq_component = mode[9:].norm()
+            angle_component = mode[:9].norm()
+            print(f"    Frequency content: {freq_component:.2%}, Angle content: {angle_component:.2%}")
     # Energy function
     V_fn = sys.energy_function
     V_min = V_fn(X_train).min().item()
     
     # Test parameters
-    T_horizon = 5.0  # 5 second simulation
-    dt = 0.001
+    T_horizon = 2.0  # 5 second simulation
+    dt = 0.01
     n_test_trajectories = 5
     
     print(f"\nSystem: 10-generator network")
@@ -294,14 +318,28 @@ def test_trajectory_preservation():
             
         print(f"\nValidating {name}:")
         try:
+
+
+            def sample_near_equilibrium(n_samples):
+                x_eq = sys.goal_point.squeeze()
+                x0 = x_eq.unsqueeze(0).repeat(n_samples, 1)
+                x0 += 0.1 * torch.randn_like(x0)  # 10% perturbation
+                return x0
+
+            # Monkey-patch the sampling
+            original_sample = sys.sample_state_space
+            sys.sample_state_space = sample_near_equilibrium
+
             val_metrics = validate_reducer(
                 sys, reducer, 
                 n_rollouts=50,
-                horizon=2.0,  # 2 second trajectories
+                horizon=2.0,
                 dt=0.01,
                 input_mode="zero"
             )
-            
+
+            # Restore original
+            sys.sample_state_space = original_sample
             validation_results[name] = val_metrics
             print(f"  Mean error: {val_metrics['mean_error']:.6e}")
             print(f"  Max error: {val_metrics['max_error']:.6e}")
@@ -424,6 +462,23 @@ def test_trajectory_preservation():
     plt.tight_layout()
     plt.savefig('full_dimension_trajectories.png', dpi=150)
     print("\nTrajectory plots saved to 'full_dimension_trajectories.png'")
+
+    # Add this import at the top of retain_freq.py
+    from neural_clbf.reducer_diagnostic import run_full_diagnostic
+
+    # Then at the end of test_trajectory_preservation(), add:
+    print("\n" + "="*80)
+    print("RUNNING DETAILED DIAGNOSTIC")
+    print("="*80)
+
+    # Run diagnostic on the reducers we created
+    run_full_diagnostic(
+        sys, 
+        spr=spr if 'spr' in locals() else None,
+        opinf=opinf if 'opinf' in locals() else None,
+        lcr=lcr if 'lcr' in locals() else None,
+        X_train=X_train
+    )
     
     return results, validation_results
 

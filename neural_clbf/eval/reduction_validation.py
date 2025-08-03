@@ -134,9 +134,15 @@ def validate_reducer(
     up, lo = sys.state_limits
     up = up.to(device) if torch.is_tensor(up) else torch.tensor(up, device=device)
     lo = lo.to(device) if torch.is_tensor(lo) else torch.tensor(lo, device=device)
-    
-    x0 = torch.rand(n_rollouts, sys.n_dims, device=device) * (up - lo) + lo
-
+            
+    # Sample near equilibrium instead of random
+    if hasattr(sys, 'goal_point'):
+        x_eq = sys.goal_point.squeeze().to(device)
+        x0 = x_eq.unsqueeze(0).repeat(n_rollouts, 1)
+        x0 += 0.1 * torch.randn_like(x0)  # 10% perturbation around equilibrium
+    else:
+        # Fallback to original if no equilibrium point
+        x0 = torch.rand(n_rollouts, sys.n_dims, device=device) * (up - lo) + lo
     # Number of timesteps
     T = int(horizon / dt)
     

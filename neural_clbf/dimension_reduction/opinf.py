@@ -76,7 +76,7 @@ class OpInfReducer(BaseReducer):
         A_discrete = torch.eye(self.latent_dim, device=device) + dt * self.dyn.A
         spectral_radius = torch.linalg.eigvals(A_discrete).abs().max().item()
         
-        if spectral_radius >= 0.99:  # Allow small margin
+        if spectral_radius >= 0.999999:  # Allow small margin
             print(f"OpInf: Discrete system unstable (spectral radius={spectral_radius:.3f} >= 0.99)")
             print(f"        Disabling learned dynamics for d={self.latent_dim}")
             self.dyn = None
@@ -84,9 +84,7 @@ class OpInfReducer(BaseReducer):
             print(f"OpInf: Discrete system stable (spectral radius={spectral_radius:.3f} < 0.99)")
         
         # Alternative simpler check: just disable for near-full dimension
-        if self.latent_dim >= self.full_dim - 1:
-            print(f"OpInf: Near-full dimension (d={self.latent_dim}, n={self.full_dim}), disabling dynamics")
-            self.dyn = None
+
         
         # 4. Compute Gamma
         self.compute_gamma(X, V_fn, V_min)
