@@ -38,6 +38,25 @@ def run_comprehensive_validation(n_nodes=10, n_rollouts=50, horizon=5.0):
     print(f"   ✓ System dimensions: {sys.n_dims} (full state)")
     print(f"   ✓ Number of controls: {sys.n_controls}")
     
+    # Debug: Check if linearise method exists and works
+    print("\n   DEBUG: Checking linearise method...")
+    if hasattr(sys, 'linearise'):
+        print("   ✓ System has linearise method")
+        try:
+            # Try calling it
+            result = sys.linearise(return_JR=True)
+            if isinstance(result, tuple) and len(result) == 3:
+                A, J, R = result
+                print(f"   ✓ linearise returns 3 matrices: A{A.shape}, J{J.shape}, R{R.shape}")
+            else:
+                print(f"   ✗ linearise returned unexpected format: {type(result)}")
+        except Exception as e:
+            print(f"   ✗ linearise method failed: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("   ✗ System does not have linearise method")
+    
     # Collect training data
     print("\n2. Collecting training trajectories...")
     start_time = time.time()
@@ -59,7 +78,8 @@ def run_comprehensive_validation(n_nodes=10, n_rollouts=50, horizon=5.0):
         print(f"\n3. Selecting reducer with d_max={d_max}...")
         start_time = time.time()
         try:
-            red = select_reducer(sys, data["X"], data["dXdt"], d_max=d_max)
+            # Use verbose mode to see what's happening
+            red = select_reducer(sys, data["X"], data["dXdt"], d_max=d_max, verbose=True)
             select_time = time.time() - start_time
             
             print(f"   ✓ Selected: {type(red).__name__}")
@@ -246,56 +266,10 @@ def plot_validation_results(results_by_d, full_dim):
     plt.show()
 
 
-def test_specific_reducer(sys, reducer_type='LyapCoherencyReducer', n_groups=3):
-    """Test a specific reducer type with detailed diagnostics."""
-    print(f"\nTesting {reducer_type} with {n_groups} groups...")
-    
-    # Collect data
-    data = sys.collect_random_trajectories(50, return_derivative=True)
-    
-    # Create specific reducer
-    if reducer_type == 'LyapCoherencyReducer':
-        from neural_clbf.dimension_reduction.lyap_coherency import LyapCoherencyReducer
-        red = LyapCoherencyReducer(sys, n_groups, data["X"])
-    else:
-        red = select_reducer(sys, data["X"], data["dXdt"], d_max=2*n_groups)
-    
-    print(f"Reducer details:")
-    print(f"  - Latent dimension: {red.latent_dim}")
-    print(f"  - Full dimension: {sys.n_dims}")
-    print(f"  - Compression: {red.latent_dim/sys.n_dims:.2%}")
-    
-    # Test forward/inverse mapping
-    x_test = data["X"][:10]
-    z = red.forward(x_test)
-    x_recon = red.inverse(z)
-    
-    recon_error = (x_test - x_recon).norm(dim=1).mean()
-    print(f"  - Reconstruction error: {recon_error:.6f}")
-    
-    # Test energy preservation
-    E_orig = sys.energy_function(x_test)
-    E_recon = sys.energy_function(x_recon)
-    energy_error = (E_orig - E_recon).abs().mean()
-    print(f"  - Energy error: {energy_error:.6f}")
-    
-    return red
-
-
 if __name__ == "__main__":
-    # Run the comprehensive validation
+    # Run the comprehensive validation  
     results = run_comprehensive_validation(
         n_nodes=10,     # 10-node power system
         n_rollouts=20,  # 20 validation trajectories
         horizon=3.0     # 3 second horizon
     )
-    
-    # Optional: test specific reducer
-    # params = dict(
-    #     M=torch.ones(10) * 2.0,
-    #     D=torch.ones(10) * 0.1,
-    #     P=torch.zeros(10),
-    #     K=torch.ones(10, 10) * 0.5,
-    # )
-    # sys = SwingEquationSystem(params)
-    # test_specific_reducer(sys, 'LyapCoherencyReducer', n_groups=3)
