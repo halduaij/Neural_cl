@@ -54,7 +54,7 @@ class SwingEquationSystem(ControlAffineSystem):
         self.P = torch.as_tensor(nominal_params["P"])
         self.K = torch.as_tensor(nominal_params["K"])   # (N,N)
 
-        self.n_machines = len(self.M)       # alias used by reducers
+        self.n_machines = self.N_NODES        # alias used by reducers
         self.N_NODES = self.n_machines
         self._goal_point = goal_point if goal_point is not None else torch.zeros((1, self.n_dims))
 
@@ -463,36 +463,39 @@ class SwingEquationSystem(ControlAffineSystem):
     # 3)  per‑machine potential energy  (needed by coherency reducer)
     # ================================================================
     def potential_energy_per_machine(self, delta: torch.Tensor) -> torch.Tensor:
-        K = torch.as_tensor(self.K)
-        diff = delta[:, :, None] - delta[:, None, :]
-        U_pair = 0.5 * K * (1 - torch.cos(diff))
-        return U_pair.sum(dim=2)
-
+        """
+        delta : (B, N) absolute angles
+        returns: (B, N) energy of each machine
+        """
+        diff = delta.unsqueeze(2) - delta.unsqueeze(1)
+        U_pair = 0.5 * self.K.to(delta.device) * (1 - torch.cos(diff))
+        return U_pair.sum(2)
 
     # ----------------------------------------------------------------- #
     #  Global swing‑energy function  H(δ, ω)
     # ----------------------------------------------------------------- #
+    # ----------------------------------------------------------------- #
+    #  Global swing‑energy H(δ, ω)                                      #
+    # ----------------------------------------------------------------- #
     def energy_function(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Compute total energy for batched state x = [θ_diff, ω].
-        θ_diff length = N-1  (angles relative to machine 1).
+        Total energy for batch x = [θ_12 … θ_1n, ω_1 … ω_n].
         """
+        B = x.shape[0]
         N = self.N_NODES
-        delta = torch.cat((
-            torch.zeros(x.shape[0], 1, device=x.device),  # θ_1 = 0 reference
-            x[:, : N - 1],
-        ), dim=1)                        # (B, N)
-        omega = x[:, N - 1:]             # (B, N)
 
-        # kinetic ½ ωᵀ M ω
+        delta = self.state_to_absolute_angles(x)             # (B, N)
+        omega = x[:, N - 1 :]                                # (B, N)
+
+        # kinetic energy
         H_kin = 0.5 * (self.M.to(x.device) * omega ** 2).sum(1)
 
-        # potential ½ Σ_ij K_ij (1‑cos(θ_i‑θ_j))
-        diff = delta.unsqueeze(2) - delta.unsqueeze(1)        # (B,N,N)
-        H_pot = 0.5 * (self.K.to(x.device) * (1 - torch.cos(diff))).sum((1, 2))
+        # potential energy
+        diff = delta.unsqueeze(2) - delta.unsqueeze(1)       # (B, N, N)
+        Kmat = self.K.to(x.device).unsqueeze(0)              # (1, N, N)
+        H_pot = 0.5 * (Kmat * (1 - torch.cos(diff))).sum((1, 2))
 
         return H_kin + H_pot
-
 
     # ----------------------------------------------------------------- #
     #  Snapshot generator for model‑order reduction & OpInf
@@ -506,39 +509,53 @@ class SwingEquationSystem(ControlAffineSystem):
         return_derivative: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Simulate `N_traj` open‑loop trajectories for data‑driven reduction.
-
-        Returns dict with keys 'X', 'U', and optionally 'dXdt'.
+        Generate open‑loop data for model‑order reduction.
         """
         up, lo = self.state_limits
         x_init = torch.rand(N_traj, self.n_dims) * (up - lo) + lo
 
         X, U, dX = [], [], []
         u_min, u_max = self.control_limits
+
         for i in range(N_traj):
             x = x_init[i : i + 1]
             for _ in range(T_steps):
-                # optional random actuation
+                # random mechanical power perturbation
                 if control_excitation > 0:
                     u = torch.rand(1, self.n_controls) * (u_max - u_min) + u_min
                     u = u * control_excitation
                 else:
                     u = torch.zeros(1, self.n_controls)
 
-                f = self._f(x, self.nominal_params)           # drift
+                f = self._f(x, self.nominal_params)
                 g = self._g(x, self.nominal_params)
-                u_reshaped = u.view(1, self.n_controls, 1)
-                xdot = f + torch.bmm(g, u_reshaped)           # (1,n,1)
+                xdot = f + torch.bmm(g, u.view(1, self.n_controls, 1))
 
                 X.append(x.squeeze(0))
                 U.append(u.squeeze(0))
                 if return_derivative:
                     dX.append(xdot.squeeze(0))
 
-                x = x + self.dt * xdot.squeeze(2)             # Euler step
+                x = x + self.dt * xdot.squeeze(2)           # Euler step
 
         out = {"X": torch.stack(X), "U": torch.stack(U)}
         if return_derivative:
             out["dXdt"] = torch.stack(dX)
         return out
 
+    # ----------------------------------------------------------------- #
+    #  Convert state vector to absolute rotor angles δ                  #
+    # ----------------------------------------------------------------- #
+    def state_to_absolute_angles(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x = [θ_12 … θ_1n, ω]  →  δ = [0, δ_2 … δ_n].
+
+        Returns
+        -------
+        delta : (B, N) tensor
+        """
+        B = x.shape[0]
+        delta_rel = x[:, : self.N_NODES - 1]
+        return torch.cat(
+            (torch.zeros(B, 1, device=x.device, dtype=x.dtype), delta_rel), dim=1
+        )

@@ -16,12 +16,8 @@ class LyapCoherencyReducer(BaseReducer):
         N = self.sys.n_machines
         M = torch.as_tensor(self.sys.M, dtype=X.dtype)
 
-        delta_abs = self.sys.state_to_absolute_angles(X)
-        omega     = X[:, self.sys.N_NODES - 1:]
-
-        kin = 0.5 * M * omega ** 2
-        pot = self.sys.potential_energy_per_machine(delta_abs)
-
+        kin = 0.5 * M * X[:, N:2*N] ** 2
+        pot = self.sys.potential_energy_per_machine(X[:, :N])
         E = kin + pot                                    # (T,N)
 
         corr = torch.corrcoef(E.T).cpu().numpy()

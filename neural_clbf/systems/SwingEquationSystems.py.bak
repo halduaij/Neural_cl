@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import Tuple, Optional, List, Dict
-
+import math
 from neural_clbf.systems import ControlAffineSystem
 from neural_clbf.systems.utils import Scenario, ScenarioList
 
@@ -48,7 +48,13 @@ class SwingEquationSystem(ControlAffineSystem):
         self.N_DIMS = 2 * self.N_NODES - 1  # One less state due to using difference
         self.N_CONTROLS = self.N_NODES
         self.max_rocof = max_rocof  # Store maximum allowed RoCoF
+        # ------------- store nominal parameters as attributes ----------
+        self.M = torch.as_tensor(nominal_params["M"])   # (N,)
+        self.D = torch.as_tensor(nominal_params["D"])
+        self.P = torch.as_tensor(nominal_params["P"])
+        self.K = torch.as_tensor(nominal_params["K"])   # (N,N)
 
+        self.n_machines = len(self.M)       # alias used by reducers
         self._goal_point = goal_point if goal_point is not None else torch.zeros((1, self.n_dims))
 
         super().__init__(
@@ -352,3 +358,222 @@ class SwingEquationSystem(ControlAffineSystem):
             scenarios.append(scenario)
         
         return scenarios
+    def solve_equilibrium(self,
+                          tol: float = 1e-10,
+                          max_iter: int = 50,
+                          verbose: bool = False) -> torch.Tensor:
+        """
+        Solve  P_i = Σ_j K_ij sin(δ_i−δ_j)  for δ  (ω = 0).
+
+        Fix δ_0 = 0 to remove the rotational degree of freedom, then apply a
+        Newton–Raphson iteration.  Returns a tensor  δ*  (N,) in radians.
+
+        Raises RuntimeError if convergence fails.
+        """
+        N = self.n_machines
+        P = torch.as_tensor(self.P)          # mechanical inputs
+        K = torch.as_tensor(self.K)
+
+        # unknowns: δ[1:]  (set δ0 = 0)
+        δ = torch.zeros(N, dtype=P.dtype)
+
+        def mismatch(delta):
+            """f(delta) = P - Σ K sin(δ_i-δ_j); returns shape (N-1,)"""
+            δ_full = torch.cat((torch.zeros(1, dtype=delta.dtype), delta))
+            diff = δ_full[:, None] - δ_full[None, :]
+            sin_mat = torch.sin(diff)
+            Pe = (K * sin_mat).sum(1)
+            return (P - Pe)[1:]              # exclude reference bus 0
+
+        for it in range(max_iter):
+            f = mismatch(δ[1:])
+            norm_f = f.norm().item()
+            if verbose:
+                print(f"iter {it}: ‖f‖ = {norm_f:.3e}")
+            if norm_f < tol:
+                break
+
+            # Jacobian H_ij = ∂f_i/∂δ_j   (i,j ≥ 1)
+            δ_full = torch.cat((torch.zeros(1, dtype=δ.dtype), δ[1:]))
+            diff = δ_full[:, None] - δ_full[None, :]
+            cos_mat = torch.cos(diff)
+            H = -K * cos_mat
+            # row/col 0 correspond to reference bus → remove
+            H = H[1:, 1:]
+
+            # Newton step
+            try:
+                Δ = torch.linalg.solve(H, f)
+            except RuntimeError:
+                raise RuntimeError("Jacobian is singular; "
+                                   "choose another reference machine.")
+
+            δ[1:] -= Δ
+
+            if torch.isnan(δ).any():
+                raise RuntimeError("Newton diverged (NaN encountered)")
+
+        else:
+            raise RuntimeError("Equilibrium solver did not converge")
+
+        if verbose:
+            print(f"Converged in {it+1} iterations; max |Δ| = {Δ.abs().max():.2e}")
+
+        return δ
+
+    # ================================================================
+    # 2)  linearise()  (uses delta_star if present, else solves)
+    # ================================================================
+    def linearise(self, return_JR: bool = False):
+        """
+        Linearise around (δ*, ω* = 0) where δ* is either supplied in
+        `self.delta_star` or computed via solve_equilibrium().
+        """
+        if not hasattr(self, "delta_star"):
+            self.delta_star = self.solve_equilibrium()
+
+        δeq = torch.as_tensor(self.delta_star)
+        N = self.n_machines
+        M = torch.as_tensor(self.M)
+        D = torch.as_tensor(self.D)
+        K = torch.as_tensor(self.K)
+
+        # Hessian of potential at δeq
+        cos_mat = torch.cos(δeq[:, None] - δeq[None, :])
+        H_δδ = torch.diag((K * cos_mat).sum(1)) - K * cos_mat
+
+        # Hessian of kinetic energy
+        H_ωω = torch.diag(M)
+
+        Hess = torch.zeros(2*N, 2*N, dtype=M.dtype)
+        Hess[:N, :N] = H_δδ
+        Hess[N:, N:] = H_ωω
+
+        # canonical J and damping R
+        I = torch.eye(N, dtype=M.dtype)
+        J = torch.block_diag(torch.zeros_like(I), I) - \
+            torch.block_diag(I, torch.zeros_like(I))
+        R = torch.block_diag(torch.zeros_like(I), torch.diag(D))
+
+        A = (J - R) @ Hess
+        return (A, J, R) if return_JR else A
+
+    # ================================================================
+    # 3)  per‑machine potential energy  (needed by coherency reducer)
+    # ================================================================
+    def potential_energy_per_machine(self, delta: torch.Tensor) -> torch.Tensor:
+        K = torch.as_tensor(self.K)
+        diff = delta[:, :, None] - delta[:, None, :]
+        U_pair = 0.5 * K * (1 - torch.cos(diff))
+        return U_pair.sum(dim=2)
+
+    # ----------------------------------------------------------------- #
+    #  Global swing‑energy function  H(δ, ω)
+    # ----------------------------------------------------------------- #
+    def energy_function(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Total swing energy for a batch of states x = [θ_12 … θ_1n,  ω_1 … ω_n].
+
+        Parameters
+        ----------
+        x : (B, 2N‑1) tensor
+            The state as used by this class: first N‑1 angle differences,
+            followed by N angular speeds.
+
+        Returns
+        -------
+        H : (B,) tensor
+            Scalar Hamiltonian (kinetic + potential) for each sample.
+        """
+        B = x.shape[0]
+        N = self.N_NODES                    # number of machines (10 here)
+
+        # ------------------------------------------------------------------
+        # reconstruct absolute angles  δ = [0, θ_12, θ_13, …, θ_1n]
+        # ------------------------------------------------------------------
+        delta = torch.cat((
+            torch.zeros(B, 1, device=x.device, dtype=x.dtype),
+            x[:, : N - 1]                                  # θ_12 … θ_1n
+        ), dim=1)                                          # -> (B, N)
+
+        # ------------------------------------------------------------------
+        # kinetic energy  ½ ωᵀ M ω
+        # ------------------------------------------------------------------
+        omega = x[:, N - 1:]                               # (B, N)
+        M = self.M.to(x.device)                            # (N,)
+        H_kin = 0.5 * (M * omega ** 2).sum(1)              # (B,)
+
+        # ------------------------------------------------------------------
+        # potential energy  ½ Σ_ij K_ij(1 – cos(δ_i – δ_j))
+        # ------------------------------------------------------------------
+        diff = delta.unsqueeze(2) - delta.unsqueeze(1)     # (B, N, N)
+        Kmat = self.K.to(x.device).unsqueeze(0)            # (1, N, N)  ← broadcast
+        H_pot = 0.5 * (Kmat * (1 - torch.cos(diff))).sum((1, 2))  # (B,)
+
+        return H_kin + H_pot                               # (B,)
+
+    # ----------------------------------------------------------------- #
+    #  Snapshot generator for model‑order reduction & OpInf
+    # ----------------------------------------------------------------- #
+    @torch.no_grad()
+    def collect_random_trajectories(
+        self,
+        N_traj: int,
+        T_steps: int = 40,
+        control_excitation: float = 0.0,
+        return_derivative: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Simulate `N_traj` open‑loop trajectories for data‑driven reduction.
+
+        Returns dict with keys 'X', 'U', and optionally 'dXdt'.
+        """
+        up, lo = self.state_limits
+        x_init = torch.rand(N_traj, self.n_dims) * (up - lo) + lo
+
+        X, U, dX = [], [], []
+        u_min, u_max = self.control_limits
+        for i in range(N_traj):
+            x = x_init[i : i + 1]
+            for _ in range(T_steps):
+                # optional random actuation
+                if control_excitation > 0:
+                    u = torch.rand(1, self.n_controls) * (u_max - u_min) + u_min
+                    u = u * control_excitation
+                else:
+                    u = torch.zeros(1, self.n_controls)
+
+                f = self._f(x, self.nominal_params)           # drift
+                g = self._g(x, self.nominal_params)
+                u_reshaped = u.view(1, self.n_controls, 1)
+                xdot = f + torch.bmm(g, u_reshaped)           # (1,n,1)
+
+                X.append(x.squeeze(0))
+                U.append(u.squeeze(0))
+                if return_derivative:
+                    dX.append(xdot.squeeze(0))
+
+                x = x + self.dt * xdot.squeeze(2)             # Euler step
+
+        out = {"X": torch.stack(X), "U": torch.stack(U)}
+        if return_derivative:
+            out["dXdt"] = torch.stack(dX)
+        return out
+
+    def state_to_absolute_angles(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert stored state [θ_12 … θ_1n, ω] to absolute angles δ = [0, δ_2 … δ_n].
+
+        Returns
+        -------
+        delta : (B, N) tensor of absolute rotor angles in radians
+        """
+        B = x.shape[0]
+        N = self.N_NODES
+        # θ_12 … θ_1n are already differences w.r.t machine 1
+        delta_rel = x[:, : N - 1]                    # (B, N‑1)
+        delta_abs = torch.cat(
+            (torch.zeros(B, 1, device=x.device, dtype=x.dtype), delta_rel),
+            dim=1
+        )
+        return delta_abs
