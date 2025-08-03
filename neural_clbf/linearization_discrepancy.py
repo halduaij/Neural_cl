@@ -54,34 +54,6 @@ def create_system():
     sys = SwingEquationSystem(params, dt=0.01)
     sys.delta_star = delta_star
     
-    # Fixed dynamics
-    def _f_fixed(x, params):
-        batch_size = x.shape[0]
-        f = torch.zeros((batch_size, 19, 1))
-        
-        theta = x[:, :9]
-        omega = x[:, 9:]
-        
-        delta_eq = delta_star
-        theta_eq = delta_eq[0] - delta_eq[1:]
-        
-        delta = torch.zeros(batch_size, 10)
-        delta[:, 0] = delta_eq[0]
-        delta[:, 1:] = delta_eq[1:] + (theta_eq - theta)
-        
-        for i in range(1, 10):
-            f[:, i-1, 0] = omega[:, 0] - omega[:, i]
-        
-        for i in range(10):
-            omega_dot = P[i] / M[i] - (D[i] / M[i]) * omega[:, i]
-            for j in range(10):
-                if i != j:
-                    omega_dot -= (K[i, j] / M[i]) * torch.sin(delta[:, i] - delta[:, j])
-            f[:, 9+i, 0] = omega_dot
-        
-        return f
-    
-    sys._f = _f_fixed
     
     return sys
 

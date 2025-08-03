@@ -672,133 +672,6 @@ class SwingEquationSystem(ControlAffineSystem):
     Add these methods to your SwingEquationSystem class
     """
 
-    def solve_equilibrium_robust(self, max_iter=1000, tol=1e-8):
-        """
-        Robust equilibrium solver that handles difficult cases.
-        
-        ADD this method to your SwingEquationSystem if you don't have it
-        """
-        import torch
-        
-        N = self.N_NODES
-        device = self.device if hasattr(self, 'device') else 'cpu'
-        
-        # Get parameters
-        P = self.nominal_params['P'].to(device)
-        K = self.nominal_params['K'].to(device)
-        
-        # Check power balance
-        P_sum = P.sum()
-        if abs(P_sum) > 1e-6:
-            print(f"Warning: Power imbalance = {P_sum:.6f}. Adjusting...")
-            P = P - P_sum / N
-            self.nominal_params['P'] = P
-        
-        # Multiple initial guesses
-        initial_guesses = []
-        
-        # Guess 1: All zeros
-        initial_guesses.append(torch.zeros(N, device=device))
-        
-        # Guess 2: DC power flow
-        try:
-            # Build DC power flow B matrix
-            B = torch.zeros(N, N, device=device)
-            for i in range(N):
-                for j in range(N):
-                    if i != j:
-                        B[i, j] = -K[i, j]
-                        B[i, i] += K[i, j]
-            
-            # Remove reference (node 0)
-            B_red = B[1:, 1:]
-            P_red = P[1:]
-            
-            # Solve DC power flow
-            delta_red = torch.linalg.solve(B_red, P_red)
-            delta_dc = torch.zeros(N, device=device)
-            delta_dc[1:] = delta_red
-            initial_guesses.append(delta_dc)
-        except:
-            pass
-        
-        # Guess 3: Small random perturbation
-        initial_guesses.append(0.1 * torch.randn(N, device=device))
-        
-        # Try each initial guess
-        best_delta = None
-        best_error = float('inf')
-        
-        for guess_idx, delta_init in enumerate(initial_guesses):
-            delta = delta_init.clone()
-            
-            # Newton-Raphson with line search
-            for iteration in range(max_iter):
-                # Compute power mismatch
-                P_calc = torch.zeros(N, device=device)
-                for i in range(N):
-                    for j in range(N):
-                        if i != j:
-                            P_calc[i] += K[i, j] * torch.sin(delta[i] - delta[j])
-                
-                mismatch = P - P_calc
-                error = mismatch.norm()
-                
-                if error < tol:
-                    print(f"  Converged with guess {guess_idx} in {iteration} iterations")
-                    return delta
-                
-                if error < best_error:
-                    best_error = error
-                    best_delta = delta.clone()
-                
-                # Jacobian
-                J = torch.zeros(N, N, device=device)
-                for i in range(N):
-                    for j in range(N):
-                        if i != j:
-                            cos_ij = torch.cos(delta[i] - delta[j])
-                            J[i, j] = -K[i, j] * cos_ij
-                            J[i, i] += K[i, j] * cos_ij
-                
-                # Remove reference
-                J_red = J[1:, 1:]
-                mismatch_red = mismatch[1:]
-                
-                try:
-                    # Add regularization if needed
-                    if torch.linalg.cond(J_red) > 1e10:
-                        J_red += 1e-6 * torch.eye(N-1, device=device)
-                    
-                    d_delta_red = torch.linalg.solve(J_red, mismatch_red)
-                    
-                    # Line search
-                    alpha = 1.0
-                    for _ in range(10):
-                        delta_new = delta.clone()
-                        delta_new[1:] += alpha * d_delta_red
-                        
-                        # Check new error
-                        P_calc_new = torch.zeros(N, device=device)
-                        for i in range(N):
-                            for j in range(N):
-                                if i != j:
-                                    P_calc_new[i] += K[i, j] * torch.sin(delta_new[i] - delta_new[j])
-                        
-                        error_new = (P - P_calc_new).norm()
-                        
-                        if error_new < error:
-                            delta = delta_new
-                            break
-                        else:
-                            alpha *= 0.5
-                            
-                except:
-                    break
-        
-        print(f"  Warning: Did not fully converge. Best error = {best_error:.2e}")
-        return best_delta
-
     def compute_equilibrium_point(self):
         '''Compute and cache the true equilibrium point in state coordinates'''
         if not hasattr(self, '_equilibrium_point_cached'):
@@ -835,17 +708,18 @@ class SwingEquationSystem(ControlAffineSystem):
         
         A = torch.autograd.functional.jacobian(dynamics, x_eq_grad)
         return A.detach().cpu().numpy().reshape(self.n_dims, self.n_dims)
-
-    # Fix the linearise method to handle the instability issue
     def linearise(self, return_JR=False):
-        '''Fixed linearise that properly handles the equilibrium point'''
+        """
+        Compute linearization at equilibrium using autograd for reliability.
+        """
         N = self.N_NODES
         n_states = 2 * N - 1
+        device = self.M.device
         
         # Ensure we have equilibrium
         if not hasattr(self, 'delta_star') or self.delta_star is None:
             print("Computing equilibrium point...")
-            self.delta_star = self.solve_equilibrium_robust() if hasattr(self, 'solve_equilibrium_robust') else self.solve_equilibrium()
+            self.delta_star = self.solve_equilibrium()
         
         # Get equilibrium in state coordinates  
         x_eq = self.compute_equilibrium_point()
@@ -853,44 +727,17 @@ class SwingEquationSystem(ControlAffineSystem):
         # Verify equilibrium
         f_eq = self._f(x_eq.unsqueeze(0), self.nominal_params).squeeze()
         eq_error = f_eq.norm().item()
-        print(f"  Equilibrium verification: ||f|| = {eq_error:.2e}")
+        print(f"    Equilibrium verification: ||f|| = {eq_error:.2e}")
         
-        # First try manual linearization as in original
-        try:
-            # Get parameters
-            device = x_eq.device
-            M = self.M.to(device)
-            D = self.D.to(device)
-            K = self.B_matrix.to(device)
-            
-            # Build A matrix manually
-            A = torch.zeros(n_states, n_states, device=device)
-            
-            # Top block: d(theta)/dt = omega differences
-            for j in range(1, N):
-                A[j-1, N-1] = 1.0      # omega_1
-                A[j-1, N-1+j] = -1.0   # omega_j
-            
-            # Bottom block: d(omega)/dt terms
-            # This is where the original method had issues
-            # We need to be at the correct equilibrium for this to work
-            
-            # Check if manual method would be stable
-            # ... (complex manual computation)
-            
-            # If we detect instability, fall back to autograd
-            raise RuntimeError("Manual linearization appears unstable, using autograd")
-            
-        except:
-            print("    Using autograd for accurate linearization...")
-            x_eq_grad = x_eq.clone().requires_grad_(True)
-            
-            def dynamics(x):
-                return self._f(x.unsqueeze(0), self.nominal_params).squeeze()
-            
-            A = torch.autograd.functional.jacobian(dynamics, x_eq_grad)
-            if A.dim() > 2:
-                A = A.squeeze()
+        # Use autograd for accurate linearization
+        x_eq_grad = x_eq.clone().requires_grad_(True)
+        
+        def dynamics(x):
+            return self._f(x.unsqueeze(0), self.nominal_params).squeeze()
+        
+        A = torch.autograd.functional.jacobian(dynamics, x_eq_grad)
+        if A.dim() > 2:
+            A = A.squeeze()
         
         # Check eigenvalues
         eigvals = torch.linalg.eigvals(A)
@@ -898,18 +745,20 @@ class SwingEquationSystem(ControlAffineSystem):
         print(f"    Linearization max eigenvalue: {max_real:.6f}")
         
         if return_JR:
-            # Build J and R matrices
+            # Build J and R matrices inline (they're specific to this system)
             J = torch.zeros(n_states, n_states, device=device)
             R = torch.zeros(n_states, n_states, device=device)
             
             # J matrix for relative coordinates
+            # J represents the symplectic structure of the system
             for j in range(1, N):
-                J[j-1, N-1] = 1.0
-                J[j-1, N-1+j] = -1.0
-                J[N-1, j-1] = -1.0
-                J[N-1+j, j-1] = 1.0
+                J[j-1, N-1] = 1.0      # ∂θ_1j/∂ω_1
+                J[j-1, N-1+j] = -1.0   # ∂θ_1j/∂ω_j
+                J[N-1, j-1] = -1.0     # ∂ω_1/∂θ_1j
+                J[N-1+j, j-1] = 1.0    # ∂ω_j/∂θ_1j
             
             # R matrix (damping)
+            D = self.D.to(device)
             for i in range(N):
                 R[N-1+i, N-1+i] = D[i]
             
@@ -917,6 +766,11 @@ class SwingEquationSystem(ControlAffineSystem):
         else:
             return A
 
+    def compute_A_matrix(self, scenario=None):
+        """
+        Compute linearized A matrix (delegates to linearise).
+        """
+        return self.linearise(return_JR=False)
     # Also add the robust equilibrium solver mentioned in the analysis:
     def solve_equilibrium_robust(self, tol=1e-10, max_iter=100, verbose=False):
         '''Robust equilibrium solver with multiple initial guesses'''

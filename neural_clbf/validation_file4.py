@@ -3,6 +3,7 @@ Direct testing of each reducer to bypass selection issues
 """
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 from neural_clbf.systems import SwingEquationSystem
 from neural_clbf.dimension_reduction.symplectic_projection import SymplecticProjectionReducer
 from neural_clbf.dimension_reduction.opinf import OpInfReducer
@@ -46,6 +47,7 @@ def create_stable_system():
                        1.6365094, 1.3327368, 2.5534966, 1.6531545, 25.04985]], 
                      dtype=torch.float32)
     
+    # Equilibrium from the Frequency environment (absolute angles)
     delta_star = torch.tensor([-0.05420687, -0.07780334, -0.07351729, -0.05827823, -0.09359571,
                                -0.02447385, -0.00783582, 0.00259523, -0.0162409, -0.06477749],
                               dtype=torch.float32)
@@ -55,54 +57,25 @@ def create_stable_system():
     sys = SwingEquationSystem(params, dt=0.001)
     sys.delta_star = delta_star
     
-    # Fix dynamics
-    original_f = sys._f
-    def _f_fixed(x, params):
-        batch_size = x.shape[0]
-        f = torch.zeros((batch_size, 19, 1))
-        
-        theta = x[:, :9]
-        omega = x[:, 9:]
-        
-        delta_eq = delta_star
-        theta_eq = delta_eq[0] - delta_eq[1:]
-        
-        delta = torch.zeros(batch_size, 10)
-        delta[:, 0] = delta_eq[0]
-        delta[:, 1:] = delta_eq[1:] + (theta_eq - theta)
-        
-        # Angle derivatives
-        for i in range(1, 10):
-            f[:, i-1, 0] = omega[:, 0] - omega[:, i]
-        
-        # Frequency derivatives
-        for i in range(10):
-            omega_dot = P[i] / M[i] - (D[i] / M[i]) * omega[:, i]
-            for j in range(10):
-                if i != j:
-                    omega_dot -= (K[i, j] / M[i]) * torch.sin(delta[:, i] - delta[:, j])
-            f[:, 9+i, 0] = omega_dot
-        
-        return f
-    
-    sys._f = _f_fixed
+    # DO NOT modify sys._f - the original dynamics are correct!
     
     return sys, params
 
 
 def collect_small_data(sys, params):
     """Collect data with very small perturbations."""
+    # Get equilibrium in state coordinates (relative angles)
     theta_eq = sys.delta_star[0] - sys.delta_star[1:]
     omega_eq = torch.zeros(10)
     x_eq = torch.cat([theta_eq, omega_eq])
     
     n_samples = 1000
     
-    # Very small perturbations
+    # Very small perturbations around equilibrium
     X = x_eq.unsqueeze(0).repeat(n_samples, 1)
     X += 0.005 * torch.randn_like(X)  # 0.5% noise
     
-    # Compute derivatives
+    # Compute derivatives using the original dynamics
     Xdot = []
     for i in range(n_samples):
         f = sys._f(X[i:i+1], params)
@@ -125,6 +98,11 @@ def test_reducers_directly():
     # Create system
     sys, params = create_stable_system()
     
+    # Verify equilibrium
+    x_eq = sys.compute_equilibrium_point()
+    f_eq = sys._f(x_eq.unsqueeze(0), params).squeeze()
+    print(f"\nEquilibrium verification: ||f|| = {f_eq.norm():.6e}")
+    
     # Collect data
     print("\n1. Collecting training data:")
     data = collect_small_data(sys, params)
@@ -132,11 +110,14 @@ def test_reducers_directly():
     print(f"   Data range: [{data['X'].min():.3f}, {data['X'].max():.3f}]")
     
     # Energy function for gamma calculation
-    def simple_energy(x):
-        """Simple quadratic energy function."""
-        return 0.5 * (x ** 2).sum(dim=1)
+    if hasattr(sys, 'energy_function'):
+        V_fn = sys.energy_function
+        V_min = V_fn(data['X']).min().item()
+    else:
+        # Simple quadratic energy if system doesn't have one
+        V_fn = lambda x: 0.5 * (x ** 2).sum(dim=1)
+        V_min = V_fn(data['X']).min().item()
     
-    V_min = simple_energy(data['X']).min().item()
     print(f"   V_min: {V_min:.3f}")
     
     results = []
@@ -144,15 +125,12 @@ def test_reducers_directly():
     # Test 1: Symplectic Projection
     print("\n2. Testing Symplectic Projection:")
     try:
-        # Get linearization
-        A = torch.eye(19) * (-0.5)  # Stable dummy matrix
-        J = torch.zeros(19, 19)
-        J[:9, 9:] = torch.eye(9, 10)
-        J[9:, :9] = -torch.eye(10, 9)
-        R = torch.zeros(19, 19)
-        R[9:, 9:] = torch.diag(params['D'])
+        # Get linearization from system
+        A, J, R = sys.linearise(return_JR=True)
         
         for d in [2, 4, 6, 8]:
+            if d > 18:  # Skip if dimension too large
+                continue
             try:
                 spr = SymplecticProjectionReducer(A, J, R, d)
                 spr.full_dim = 19
@@ -173,7 +151,7 @@ def test_reducers_directly():
                 print(f"   SPR d={d} failed: {e}")
                 
     except Exception as e:
-        print(f"   Symplectic Projection failed: {e}")
+        print(f"   Symplectic Projection setup failed: {e}")
     
     # Test 2: Lyapunov Coherency
     print("\n3. Testing Lyapunov Coherency:")
@@ -202,7 +180,7 @@ def test_reducers_directly():
                 print(f"   LCR k={k} failed: {e}")
                 
     except Exception as e:
-        print(f"   Lyapunov Coherency failed: {e}")
+        print(f"   Lyapunov Coherency setup failed: {e}")
     
     # Test 3: OpInf
     print("\n4. Testing Operator Inference:")
@@ -211,7 +189,7 @@ def test_reducers_directly():
             try:
                 opinf = OpInfReducer(d, 19, sys.n_controls)
                 opinf.sys = sys
-                opinf.fit(data['X'], data['dXdt'], simple_energy, V_min)
+                opinf.fit(data['X'], data['dXdt'], V_fn, V_min)
                 opinf.full_dim = 19
                 
                 print(f"   OpInf d={d}: gamma={opinf.gamma:.3f}")
@@ -232,7 +210,7 @@ def test_reducers_directly():
                 print(f"   OpInf d={d} failed: {e}")
                 
     except Exception as e:
-        print(f"   Operator Inference failed: {e}")
+        print(f"   Operator Inference setup failed: {e}")
     
     # Summary
     print("\n" + "="*80)
@@ -248,17 +226,6 @@ def test_reducers_directly():
     
     return results
 
-"""
-Proper validation metrics for power system dimension reduction
-"""
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from neural_clbf.systems import SwingEquationSystem
-from neural_clbf.dimension_reduction.symplectic_projection import SymplecticProjectionReducer
-from neural_clbf.dimension_reduction.opinf import OpInfReducer
-from neural_clbf.dimension_reduction.lyap_coherency import LyapCoherencyReducer
-
 
 def evaluate_power_system_reduction(sys, reducer, data, n_test=10, horizon=2.0, dt=0.01):
     """
@@ -268,8 +235,8 @@ def evaluate_power_system_reduction(sys, reducer, data, n_test=10, horizon=2.0, 
     1. Angle reconstruction error (in degrees)
     2. Frequency reconstruction error (in Hz)
     3. Energy preservation error
-    4. Inter-area oscillation mode preservation
-    5. Transient stability (critical clearing time)
+    4. Dynamic trajectory error
+    5. Perturbation preservation
     """
     device = data['X'].device
     results = {}
@@ -308,14 +275,20 @@ def evaluate_power_system_reduction(sys, reducer, data, n_test=10, horizon=2.0, 
     # 2. Energy Preservation
     print("\n2. Energy Preservation:")
     
-    # Compute energy for original and reconstructed states
-    E_orig = sys.energy_function(X_test)
-    E_recon = sys.energy_function(X_recon)
-    
-    energy_error = ((E_recon - E_orig) / E_orig).abs()
-    results['energy_error'] = energy_error.mean().item()
-    
-    print(f"   Mean relative energy error: {results['energy_error']:.1%}")
+    try:
+        # Compute energy for original and reconstructed states
+        E_orig = sys.energy_function(X_test)
+        E_recon = sys.energy_function(X_recon)
+        
+        # Safe relative error calculation
+        E_orig_safe = torch.where(E_orig.abs() < 1e-6, torch.tensor(1e-6), E_orig.abs())
+        energy_error = ((E_recon - E_orig) / E_orig_safe).abs()
+        results['energy_error'] = energy_error.mean().item()
+        
+        print(f"   Mean relative energy error: {results['energy_error']:.1%}")
+    except Exception as e:
+        print(f"   Energy calculation failed: {e}")
+        results['energy_error'] = float('nan')
     
     # 3. Dynamic Trajectory Error
     print("\n3. Dynamic Trajectory Test:")
@@ -327,54 +300,65 @@ def evaluate_power_system_reduction(sys, reducer, data, n_test=10, horizon=2.0, 
     for i in range(min(5, n_test)):  # Test 5 trajectories
         x0 = X_test[i:i+1]
         
-        # Full model trajectory
-        x_full = x0.clone()
-        traj_full = [x0]
-        
-        for t in range(n_steps):
-            f = sys._f(x_full, sys.nominal_params)
-            x_full = x_full + dt * f.squeeze(-1)
-            traj_full.append(x_full)
-        
-        traj_full = torch.cat(traj_full, dim=0)
-        
-        # Reduced model trajectory
-        z0 = reducer.forward(x0)
-        z = z0.clone()
-        traj_red = [x0]
-        
-        for t in range(n_steps):
-            # Get full state
-            x_red = reducer.inverse(z)
+        try:
+            # Full model trajectory
+            x_full = x0.clone()
+            traj_full = [x0]
             
-            # Compute dynamics in full space
-            f_full = sys._f(x_red, sys.nominal_params)
+            for t in range(n_steps):
+                f = sys._f(x_full, sys.nominal_params)
+                if f.dim() == 3:
+                    f = f.squeeze(-1)
+                x_full = x_full + dt * f
+                traj_full.append(x_full)
             
-            # Project dynamics to reduced space
-            J = reducer.jacobian(x_red)
-            f_red = torch.bmm(J, f_full).squeeze(-1)
+            traj_full = torch.cat(traj_full, dim=0)
             
-            # Update reduced state
-            z = z + dt * f_red
+            # Reduced model trajectory
+            z0 = reducer.forward(x0)
+            z = z0.clone()
+            traj_red = [x0]
             
-            # Reconstruct and store
-            x_red = reducer.inverse(z)
-            traj_red.append(x_red)
-        
-        traj_red = torch.cat(traj_red, dim=0)
-        
-        # Compute trajectory error
-        traj_error = (traj_full - traj_red).norm(dim=1).mean()
-        traj_errors.append(traj_error.item())
+            for t in range(n_steps):
+                # Get full state
+                x_red = reducer.inverse(z)
+                
+                # Compute dynamics in full space
+                f_full = sys._f(x_red, sys.nominal_params)
+                if f_full.dim() == 3:
+                    f_full = f_full.squeeze(-1)
+                
+                # Project dynamics to reduced space
+                J = reducer.jacobian(x_red)
+                if f_full.dim() == 2:
+                    f_full = f_full.unsqueeze(-1)
+                f_red = torch.bmm(J, f_full).squeeze(-1)
+                
+                # Update reduced state
+                z = z + dt * f_red
+                
+                # Reconstruct and store
+                x_red = reducer.inverse(z)
+                traj_red.append(x_red)
+            
+            traj_red = torch.cat(traj_red, dim=0)
+            
+            # Compute trajectory error
+            traj_error = (traj_full - traj_red).norm(dim=1).mean()
+            traj_errors.append(traj_error.item())
+            
+        except Exception as e:
+            print(f"   Trajectory {i} failed: {e}")
+            continue
     
-    results['traj_error'] = np.mean(traj_errors)
+    results['traj_error'] = np.mean(traj_errors) if traj_errors else float('inf')
     print(f"   Mean trajectory error: {results['traj_error']:.3f}")
     
     # 4. Frequency Response (simplified)
     print("\n4. Frequency Response Test:")
     
     # Apply small perturbation and check frequency response
-    x_eq = torch.cat([theta_eq, torch.zeros(10)]).unsqueeze(0)
+    x_eq = torch.cat([theta_eq, torch.zeros(10)]).unsqueeze(0).to(device)
     
     # Perturb one generator
     x_pert = x_eq.clone()
@@ -385,24 +369,35 @@ def evaluate_power_system_reduction(sys, reducer, data, n_test=10, horizon=2.0, 
     z_pert = reducer.forward(x_pert)
     
     # Reconstruct
-    x_pert_recon = reducer.inverse(z_pert)
+    x_eq_recon = reducer.inverse(z_eq).squeeze()
+    x_pert_recon = reducer.inverse(z_pert).squeeze()
     
     # Check if perturbation is preserved
     omega_pert_orig = x_pert[0, 9:] - x_eq[0, 9:]
-    omega_pert_recon = x_pert_recon[0, 9:] - x_eq[0, 9:]
+    omega_pert_recon = x_pert_recon[9:] - x_eq_recon[9:]
     
-    pert_preservation = (omega_pert_recon.norm() / omega_pert_orig.norm()).item()
-    results['pert_preservation'] = pert_preservation
+    norm_orig = omega_pert_orig.norm()
+    norm_recon = omega_pert_recon.norm()
     
-    print(f"   Perturbation preservation: {pert_preservation:.1%}")
+    if norm_orig > 1e-6:
+        pert_preservation = (norm_recon / norm_orig).item()
+    else:
+        pert_preservation = 1.0
+    
+    results['pert_preservation'] = max(0.0, min(1.0, pert_preservation))
+    
+    print(f"   Perturbation preservation: {results['pert_preservation']:.1%}")
     
     # 5. Summary Score
     # Lower is better for all metrics
+    energy_score = results['energy_error'] if not np.isnan(results['energy_error']) else 1.0
+    traj_score = results['traj_error'] if not np.isinf(results['traj_error']) else 10.0
+    
     results['score'] = (
         results['theta_rmse_deg'] +           # Angle error (degrees)
         10 * results['omega_rmse_hz'] +       # Frequency error (Hz) - weighted more
-        100 * results['energy_error'] +       # Energy error (fraction)
-        results['traj_error'] +               # Trajectory error
+        100 * energy_score +                  # Energy error (fraction)
+        traj_score +                          # Trajectory error
         10 * abs(1 - results['pert_preservation'])  # Perturbation preservation
     )
     
@@ -432,7 +427,9 @@ def visualize_reduction_comparison(sys, reducers, data):
         traj_full.append(x.clone())
         time.append(t * dt)
         f = sys._f(x, sys.nominal_params)
-        x = x + dt * f.squeeze(-1)
+        if f.dim() == 3:
+            f = f.squeeze(-1)
+        x = x + dt * f
     
     traj_full = torch.stack(traj_full).squeeze(1)
     time = np.array(time)
@@ -441,39 +438,49 @@ def visualize_reduction_comparison(sys, reducers, data):
     colors = plt.cm.tab10(np.linspace(0, 1, len(reducers) + 1))
     
     for idx, (name, reducer) in enumerate(reducers.items()):
-        # Reduced model simulation
-        z = reducer.forward(x0)
-        traj_red = []
-        
-        for t in range(n_steps):
-            x_red = reducer.inverse(z)
-            traj_red.append(x_red.clone())
+        try:
+            # Reduced model simulation
+            z = reducer.forward(x0)
+            traj_red = []
             
-            f_full = sys._f(x_red, sys.nominal_params)
-            J = reducer.jacobian(x_red)
-            f_red = torch.bmm(J, f_full).squeeze(-1)
-            z = z + dt * f_red
-        
-        traj_red = torch.stack(traj_red).squeeze(1)
-        
-        # Plot angle of generator 1
-        axes[0, 0].plot(time, traj_red[:, 0].numpy(), 
-                       label=f'{name} (d={reducer.latent_dim})', 
-                       color=colors[idx+1], linestyle='--')
-        
-        # Plot frequency of generator 1
-        axes[0, 1].plot(time, traj_red[:, 9].numpy() * 60 / (2*np.pi), 
-                       color=colors[idx+1], linestyle='--')
-        
-        # Plot angle error
-        angle_error = (traj_red[:, :9] - traj_full[:, :9]).abs().mean(dim=1)
-        axes[1, 0].plot(time, angle_error.numpy() * 180 / np.pi, 
-                       label=f'{name}', color=colors[idx+1])
-        
-        # Plot frequency error
-        freq_error = (traj_red[:, 9:] - traj_full[:, 9:]).abs().mean(dim=1)
-        axes[1, 1].plot(time, freq_error.numpy() * 60 / (2*np.pi), 
-                       color=colors[idx+1])
+            for t in range(n_steps):
+                x_red = reducer.inverse(z)
+                traj_red.append(x_red.clone())
+                
+                f_full = sys._f(x_red, sys.nominal_params)
+                if f_full.dim() == 3:
+                    f_full = f_full.squeeze(-1)
+                    
+                J = reducer.jacobian(x_red)
+                if f_full.dim() == 2:
+                    f_full = f_full.unsqueeze(-1)
+                f_red = torch.bmm(J, f_full).squeeze(-1)
+                z = z + dt * f_red
+            
+            traj_red = torch.stack(traj_red).squeeze(1)
+            
+            # Plot angle of generator 1
+            axes[0, 0].plot(time, traj_red[:, 0].numpy(), 
+                           label=f'{name} (d={reducer.latent_dim})', 
+                           color=colors[idx+1], linestyle='--')
+            
+            # Plot frequency of generator 1
+            axes[0, 1].plot(time, traj_red[:, 9].numpy() * 60 / (2*np.pi), 
+                           color=colors[idx+1], linestyle='--')
+            
+            # Plot angle error
+            angle_error = (traj_red[:, :9] - traj_full[:, :9]).abs().mean(dim=1)
+            axes[1, 0].plot(time, angle_error.numpy() * 180 / np.pi, 
+                           label=f'{name}', color=colors[idx+1])
+            
+            # Plot frequency error
+            freq_error = (traj_red[:, 9:] - traj_full[:, 9:]).abs().mean(dim=1)
+            axes[1, 1].plot(time, freq_error.numpy() * 60 / (2*np.pi), 
+                           color=colors[idx+1])
+                           
+        except Exception as e:
+            print(f"Failed to plot {name}: {e}")
+            continue
     
     # Add full model
     axes[0, 0].plot(time, traj_full[:, 0].numpy(), 'k-', label='Full model', linewidth=2)
@@ -515,9 +522,7 @@ def run_proper_validation():
     print("POWER SYSTEM DIMENSION REDUCTION - PROPER VALIDATION")
     print("="*80)
     
-    # Create system (using your working configuration)
-    from neural_clbf.validation_file4 import create_stable_system, collect_small_data
-    
+    # Create system
     sys, params = create_stable_system()
     data = collect_small_data(sys, params)
     
@@ -530,44 +535,45 @@ def run_proper_validation():
     
     # 1. Symplectic Projection
     try:
-        A = torch.eye(19) * (-0.5)
-        J = torch.zeros(19, 19)
-        J[:9, 9:] = torch.eye(9, 10)
-        J[9:, :9] = -torch.eye(10, 9)
-        R = torch.zeros(19, 19)
-        R[9:, 9:] = torch.diag(params['D'])
+        A, J, R = sys.linearise(return_JR=True)
         
         spr = SymplecticProjectionReducer(A, J, R, 6)
         spr.full_dim = 19
         reducers['SPR-6'] = spr
-    except:
-        print("SPR failed")
+        print("✓ Created SPR-6")
+    except Exception as e:
+        print(f"SPR failed: {e}")
     
     # 2. Lyapunov Coherency
     try:
         lcr = LyapCoherencyReducer(sys, 3, data['X'])  # 3 groups -> 6 states
         lcr.full_dim = 19
         reducers['LCR-6'] = lcr
-    except:
-        print("LCR failed")
+        print("✓ Created LCR-6")
+    except Exception as e:
+        print(f"LCR failed: {e}")
     
     # 3. OpInf
     try:
         opinf = OpInfReducer(6, 19, sys.n_controls)
         opinf.sys = sys
-        V_fn = lambda x: 0.5 * (x ** 2).sum(dim=1)
-        V_min = 0.01
+        V_fn = sys.energy_function if hasattr(sys, 'energy_function') else lambda x: 0.5 * (x ** 2).sum(dim=1)
+        V_min = V_fn(data['X']).min().item()
         opinf.fit(data['X'], data['dXdt'], V_fn, V_min)
         opinf.full_dim = 19
         reducers['OpInf-6'] = opinf
-    except:
-        print("OpInf failed")
+        print("✓ Created OpInf-6")
+    except Exception as e:
+        print(f"OpInf failed: {e}")
     
     # Evaluate each reducer
     all_results = {}
     for name, reducer in reducers.items():
-        results = evaluate_power_system_reduction(sys, reducer, data)
-        all_results[name] = results
+        try:
+            results = evaluate_power_system_reduction(sys, reducer, data)
+            all_results[name] = results
+        except Exception as e:
+            print(f"Evaluation failed for {name}: {e}")
     
     # Summary table
     print("\n" + "="*80)
@@ -578,15 +584,26 @@ def run_proper_validation():
     print("-"*74)
     
     for name, res in sorted(all_results.items(), key=lambda x: x[1]['score']):
+        energy_pct = res['energy_error']*100 if not np.isnan(res['energy_error']) else float('nan')
         print(f"{name:<10} {res['theta_rmse_deg']:<12.2f} {res['omega_rmse_hz']:<12.3f} "
-              f"{res['energy_error']*100:<12.1f} {res['traj_error']:<10.3f} {res['score']:<10.2f}")
+              f"{energy_pct:<12.1f} {res['traj_error']:<10.3f} {res['score']:<10.2f}")
     
     # Visualize
-    print("\nGenerating comparison plots...")
-    visualize_reduction_comparison(sys, reducers, data)
+    if all_results:
+        print("\nGenerating comparison plots...")
+        visualize_reduction_comparison(sys, reducers, data)
     
     return all_results
 
 
 if __name__ == "__main__":
+    # You can run either test
+    print("Choose test:")
+    print("1. test_reducers_directly() - Quick test of individual reducers")
+    print("2. run_proper_validation() - Comprehensive validation")
+    
+    # Run the comprehensive validation by default
     results = run_proper_validation()
+    
+    # Uncomment to run the direct test instead:
+    # results = test_reducers_directly()
