@@ -26,7 +26,7 @@ def select_reducer(sys, X, Xdot, d_max=12, w_dim=0.02):
 
     for k in (2,3,4):
         lcr = LCR(sys, k, X); lcr.full_dim = n
-        lcr.gamma = lcr.gamma(float(V_min)); candidates.append(lcr)
+        lcr.gamma = lcr.compute_gamma(float(V_min)); candidates.append(lcr)
 
     for d in range(4, min(d_max, n)):
         opinf = OpInfReducer(d, n).fit(X, Xdot, V, V_min)

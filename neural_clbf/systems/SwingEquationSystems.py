@@ -20,7 +20,7 @@ class SwingEquationSystem(ControlAffineSystem):
         M: inertia constants (vector of length n)
         D: damping coefficients (vector of length n)
         P: mechanical power inputs (vector of length n)
-        K: coupling strength matrix (n x n)
+        B_matrix: coupling strength matrix (n x n) - renamed from K to avoid conflict
     """
 
     def __init__(
@@ -48,19 +48,87 @@ class SwingEquationSystem(ControlAffineSystem):
         self.N_DIMS = 2 * self.N_NODES - 1  # One less state due to using difference
         self.N_CONTROLS = self.N_NODES
         self.max_rocof = max_rocof  # Store maximum allowed RoCoF
-        # ------------- store nominal parameters as attributes ----------
-        self.M = torch.as_tensor(nominal_params["M"])   # (N,)
-        self.D = torch.as_tensor(nominal_params["D"])
-        self.P = torch.as_tensor(nominal_params["P"])
-        self.K = torch.as_tensor(nominal_params["K"])   # (N,N)
+        
+        # Store parameters with different names to avoid conflict with parent class
+        # Parent class uses self.P for Lyapunov matrix and self.K for controller gain
+        self.M_inertia = torch.as_tensor(nominal_params["M"])   # (N,)
+        self.D_damping = torch.as_tensor(nominal_params["D"])
+        self.P_mechanical = torch.as_tensor(nominal_params["P"])
+        self.B_matrix = torch.as_tensor(nominal_params["K"])   # (N,N) - coupling matrix
+        
+        # Create aliases for backward compatibility
+        self.M = self.M_inertia
+        self.D = self.D_damping
+        # Don't create alias for P to avoid conflict
+        
+        # Verify B_matrix has the correct shape
+        assert self.B_matrix.shape == (self.N_NODES, self.N_NODES), \
+            f"Coupling matrix has wrong shape: {self.B_matrix.shape}, expected ({self.N_NODES}, {self.N_NODES})"
 
         self.n_machines = self.N_NODES        # alias used by reducers
-        self.N_NODES = self.n_machines
         self._goal_point = goal_point if goal_point is not None else torch.zeros((1, self.n_dims))
 
         super().__init__(
-            nominal_params, dt=dt, controller_dt=controller_dt, scenarios=scenarios
+            nominal_params, dt=dt, controller_dt=controller_dt, scenarios=scenarios,
+            use_linearized_controller=False  # Don't compute linearized controller
         )
+        
+    # Property to maintain compatibility with code that expects self.K
+    @property
+    def K(self):
+        """Return the coupling matrix (for backward compatibility)"""
+        return self.B_matrix  # FIXED: return B_matrix, not self
+    
+    def compute_linearized_controller(self, scenarios: Optional[ScenarioList] = None):
+        """
+        Override parent's method to set dummy P and K matrices that the parent expects.
+        The swing equation system doesn't use the linearized controller from the parent class.
+        """
+        # Set dummy P (Lyapunov matrix) and K (controller gain) for parent class
+        # These are not used by our system but parent class methods might expect them
+        self.P = torch.eye(self.n_dims, dtype=torch.float32)
+        self.K = torch.zeros(self.n_controls, self.n_dims, dtype=torch.float32)
+    
+    def simulate(self, x_init, num_steps, *args, **kwargs):
+        """
+        Override parent's simulate to handle the validation's u parameter.
+        
+        The validation passes u as a keyword argument, which the parent doesn't accept.
+        This method extracts u, converts it to a controller, and calls parent's simulate.
+        """
+        # Extract u if provided
+        u = kwargs.pop('u', None)
+        
+        # Handle controller - either from args or create from u
+        if len(args) >= 1:
+            # Controller was passed as positional argument
+            controller = args[0]
+            remaining_args = args[1:]
+        else:
+            # No positional controller, check if we have u
+            if u is not None:
+                # Create controller from u
+                timestep_counter = {'t': 0}
+                
+                def u_controller(x):
+                    t = timestep_counter['t']
+                    if u.dim() == 3 and t < u.shape[1]:
+                        control = u[:, t, :]
+                    elif u.dim() == 2:
+                        control = u
+                    else:
+                        control = self.u_nominal(x)
+                    timestep_counter['t'] += 1
+                    return control
+                
+                controller = u_controller
+            else:
+                # Use nominal controller
+                controller = self.u_nominal
+            remaining_args = ()
+        
+        # Call parent's simulate - FIXED: removed .B_matrix at the end
+        return super().simulate(x_init, num_steps, controller, *remaining_args, **kwargs)
 
     def validate_params(self, params: Scenario) -> bool:
         """
@@ -254,10 +322,11 @@ class SwingEquationSystem(ControlAffineSystem):
         f = torch.zeros((batch_size, self.n_dims, 1))
         f = f.type_as(x)
 
-        M = params["M"].expand(batch_size, -1)
-        D = params["D"].expand(batch_size, -1)
-        P = params["P"].expand(batch_size, -1)
-        K = params["K"]
+        # Get parameters - use self attributes which maintain correct shapes
+        M = self.M.to(x.device).expand(batch_size, -1)
+        D = self.D.to(x.device).expand(batch_size, -1)
+        P = self.P_mechanical.to(x.device).expand(batch_size, -1)
+        B = self.B_matrix.to(x.device)  # Coupling matrix
         
         theta = x[:, :self.N_NODES - 1]
         omega = x[:, self.N_NODES - 1:]
@@ -271,18 +340,18 @@ class SwingEquationSystem(ControlAffineSystem):
         i = 0
         coupling_sum_1 = torch.zeros(batch_size).type_as(x)
         for j in range(1, self.N_NODES):
-            coupling_sum_1 += K[i, j] * torch.sin(theta[:, j - 1])
+            coupling_sum_1 += B[i, j] * torch.sin(theta[:, j - 1])
         f[:, self.N_NODES - 1 + i, 0] = (P[:, i] - D[:, i] * omega[:, i] - coupling_sum_1) / M[:, i]
 
         # For omega_i (i = 2, ..., n)
         for i in range(1, self.N_NODES):
             coupling_sum_i = torch.zeros(batch_size).type_as(x)
             # B_1i * sin(theta_1i)
-            coupling_sum_i += K[i, 0] * torch.sin(theta[:, i - 1])
+            coupling_sum_i += B[i, 0] * torch.sin(theta[:, i - 1])
             # Sum B_ij * sin(theta_1i - theta_1j), j != i
             for j in range(1, self.N_NODES):
                 if i != j:
-                    coupling_sum_i += K[i, j] * torch.sin(theta[:, i - 1] - theta[:, j - 1])
+                    coupling_sum_i += B[i, j] * torch.sin(theta[:, i - 1] - theta[:, j - 1])
             f[:, self.N_NODES - 1 + i, 0] = (P[:, i] - D[:, i] * omega[:, i] + coupling_sum_i) / M[:, i]
 
         return f
@@ -302,7 +371,7 @@ class SwingEquationSystem(ControlAffineSystem):
         g = torch.zeros((batch_size, self.n_dims, self.n_controls))
         g = g.type_as(x)
 
-        M = params["M"].expand(batch_size, -1)
+        M = self.M.to(x.device).expand(batch_size, -1)
 
         for i in range(self.N_NODES):
             g[:, self.N_NODES - 1 + i, i] = 1 / M[:, i]
@@ -319,9 +388,9 @@ class SwingEquationSystem(ControlAffineSystem):
         returns:
             u_nominal: bs x self.n_controls tensor of nominal control inputs
         """
-        K = 1.0  # Some nominal gain
+        K_gain = 1.0  # Controller gain (different from coupling matrix)
         omega = x[:, self.N_NODES - 1:]
-        u_nominal = -K * omega
+        u_nominal = -K_gain * omega
         return u_nominal
         
     def create_realistic_scenarios(self, n_scenarios: int = 5, variation: float = 0.2) -> ScenarioList:
@@ -359,12 +428,13 @@ class SwingEquationSystem(ControlAffineSystem):
             scenarios.append(scenario)
         
         return scenarios
+        
     def solve_equilibrium(self,
                           tol: float = 1e-10,
                           max_iter: int = 50,
                           verbose: bool = False) -> torch.Tensor:
         """
-        Solve  P_i = Σ_j K_ij sin(δ_i−δ_j)  for δ  (ω = 0).
+        Solve  P_i = Σ_j B_ij sin(δ_i−δ_j)  for δ  (ω = 0).
 
         Fix δ_0 = 0 to remove the rotational degree of freedom, then apply a
         Newton–Raphson iteration.  Returns a tensor  δ*  (N,) in radians.
@@ -372,18 +442,18 @@ class SwingEquationSystem(ControlAffineSystem):
         Raises RuntimeError if convergence fails.
         """
         N = self.n_machines
-        P = torch.as_tensor(self.P)          # mechanical inputs
-        K = torch.as_tensor(self.K)
+        P = torch.as_tensor(self.P_mechanical)          # mechanical inputs
+        B = torch.as_tensor(self.B_matrix)   # coupling matrix
 
         # unknowns: δ[1:]  (set δ0 = 0)
         δ = torch.zeros(N, dtype=P.dtype)
 
         def mismatch(delta):
-            """f(delta) = P - Σ K sin(δ_i-δ_j); returns shape (N-1,)"""
+            """f(delta) = P - Σ B sin(δ_i-δ_j); returns shape (N-1,)"""
             δ_full = torch.cat((torch.zeros(1, dtype=delta.dtype), delta))
             diff = δ_full[:, None] - δ_full[None, :]
             sin_mat = torch.sin(diff)
-            Pe = (K * sin_mat).sum(1)
+            Pe = (B * sin_mat).sum(1)
             return (P - Pe)[1:]              # exclude reference bus 0
 
         for it in range(max_iter):
@@ -398,7 +468,7 @@ class SwingEquationSystem(ControlAffineSystem):
             δ_full = torch.cat((torch.zeros(1, dtype=δ.dtype), δ[1:]))
             diff = δ_full[:, None] - δ_full[None, :]
             cos_mat = torch.cos(diff)
-            H = -K * cos_mat
+            H = -B * cos_mat
             # row/col 0 correspond to reference bus → remove
             H = H[1:, 1:]
 
@@ -422,9 +492,6 @@ class SwingEquationSystem(ControlAffineSystem):
 
         return δ
 
-    # ================================================================
-    # 2)  linearise()  (uses delta_star if present, else solves)
-    # ================================================================
     def linearise(self, return_JR: bool = False):
         """
         Linearise around (δ*, ω* = 0) where δ* is either supplied in
@@ -437,11 +504,11 @@ class SwingEquationSystem(ControlAffineSystem):
         N = self.n_machines
         M = torch.as_tensor(self.M)
         D = torch.as_tensor(self.D)
-        K = torch.as_tensor(self.K)
+        B = torch.as_tensor(self.B_matrix)  # coupling matrix
 
         # Hessian of potential at δeq
         cos_mat = torch.cos(δeq[:, None] - δeq[None, :])
-        H_δδ = torch.diag((K * cos_mat).sum(1)) - K * cos_mat
+        H_δδ = torch.diag((B * cos_mat).sum(1)) - B * cos_mat
 
         # Hessian of kinetic energy
         H_ωω = torch.diag(M)
@@ -459,24 +526,15 @@ class SwingEquationSystem(ControlAffineSystem):
         A = (J - R) @ Hess
         return (A, J, R) if return_JR else A
 
-    # ================================================================
-    # 3)  per‑machine potential energy  (needed by coherency reducer)
-    # ================================================================
     def potential_energy_per_machine(self, delta: torch.Tensor) -> torch.Tensor:
         """
         delta : (B, N) absolute angles
         returns: (B, N) energy of each machine
         """
         diff = delta.unsqueeze(2) - delta.unsqueeze(1)
-        U_pair = 0.5 * self.K.to(delta.device) * (1 - torch.cos(diff))
+        U_pair = 0.5 * self.B_matrix.to(delta.device) * (1 - torch.cos(diff))
         return U_pair.sum(2)
 
-    # ----------------------------------------------------------------- #
-    #  Global swing‑energy function  H(δ, ω)
-    # ----------------------------------------------------------------- #
-    # ----------------------------------------------------------------- #
-    #  Global swing‑energy H(δ, ω)                                      #
-    # ----------------------------------------------------------------- #
     def energy_function(self, x: torch.Tensor) -> torch.Tensor:
         """
         Total energy for batch x = [θ_12 … θ_1n, ω_1 … ω_n].
@@ -488,18 +546,26 @@ class SwingEquationSystem(ControlAffineSystem):
         omega = x[:, N - 1 :]                                # (B, N)
 
         # kinetic energy
-        H_kin = 0.5 * (self.M.to(x.device) * omega ** 2).sum(1)
+        M_device = self.M.to(x.device)
+        H_kin = 0.5 * (M_device * omega ** 2).sum(1)
 
         # potential energy
-        diff = delta.unsqueeze(2) - delta.unsqueeze(1)       # (B, N, N)
-        Kmat = self.K.to(x.device).unsqueeze(0)              # (1, N, N)
-        H_pot = 0.5 * (Kmat * (1 - torch.cos(diff))).sum((1, 2))
+        delta_i = delta.unsqueeze(2)    # (B, N, 1)
+        delta_j = delta.unsqueeze(1)    # (B, 1, N)
+        diff = delta_i - delta_j        # (B, N, N) via broadcasting
+        
+        # Use B_matrix (coupling matrix)
+        B_device = self.B_matrix.to(x.device)
+        if B_device.dim() == 2:
+            B_device = B_device.unsqueeze(0)  # (1, N, N)
+        
+        # Compute potential energy
+        cos_diff = torch.cos(diff)
+        potential_matrix = B_device * (1 - cos_diff)
+        H_pot = 0.5 * potential_matrix.sum(dim=(1, 2))
 
         return H_kin + H_pot
 
-    # ----------------------------------------------------------------- #
-    #  Snapshot generator for model‑order reduction & OpInf
-    # ----------------------------------------------------------------- #
     @torch.no_grad()
     def collect_random_trajectories(
         self,
@@ -534,7 +600,8 @@ class SwingEquationSystem(ControlAffineSystem):
                 X.append(x.squeeze(0))
                 U.append(u.squeeze(0))
                 if return_derivative:
-                    dX.append(xdot.squeeze(0))
+                    # Properly squeeze xdot from (1, n_dims, 1) to (n_dims,)
+                    dX.append(xdot.squeeze())
 
                 x = x + self.dt * xdot.squeeze(2)           # Euler step
 
@@ -543,9 +610,6 @@ class SwingEquationSystem(ControlAffineSystem):
             out["dXdt"] = torch.stack(dX)
         return out
 
-    # ----------------------------------------------------------------- #
-    #  Convert state vector to absolute rotor angles δ                  #
-    # ----------------------------------------------------------------- #
     def state_to_absolute_angles(self, x: torch.Tensor) -> torch.Tensor:
         """
         x = [θ_12 … θ_1n, ω]  →  δ = [0, δ_2 … δ_n].
@@ -559,3 +623,41 @@ class SwingEquationSystem(ControlAffineSystem):
         return torch.cat(
             (torch.zeros(B, 1, device=x.device, dtype=x.dtype), delta_rel), dim=1
         )
+    
+    def to(self, device):
+        """
+        Move the system to a specific device (CPU/GPU).
+        
+        args:
+            device: torch device or string ('cpu', 'cuda', etc.)
+        
+        returns:
+            self (for chaining)
+        """
+        # Convert string to device if needed
+        if isinstance(device, str):
+            device = torch.device(device)
+            
+        # Move all tensor attributes to the device
+        self.M_inertia = self.M_inertia.to(device)
+        self.M = self.M_inertia  # Update alias
+        self.D_damping = self.D_damping.to(device)
+        self.D = self.D_damping  # Update alias
+        self.P_mechanical = self.P_mechanical.to(device)
+        self.B_matrix = self.B_matrix.to(device)
+        
+        if hasattr(self, '_goal_point'):
+            self._goal_point = self._goal_point.to(device)
+            
+        if hasattr(self, 'delta_star'):
+            self.delta_star = self.delta_star.to(device)
+            
+        # Call parent's to method if it exists
+        if hasattr(super(), 'to'):
+            try:
+                super().to(device)
+            except:
+                # Parent might not have a to method or might handle it differently
+                pass
+            
+        return self
