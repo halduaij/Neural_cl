@@ -106,7 +106,7 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         # Save the provided model
         self.scenarios = scenarios
         self.n_scenarios = len(scenarios)
-        self.reducer = reducer 
+
         # Save the datamodule
         self.datamodule = datamodule
 

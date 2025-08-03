@@ -133,7 +133,6 @@ def train_neural_clbf(
     # Create the neural CLBF controller
     controller = NeuralCLBFController(
         dynamics_model=system,
-        reducer=reducer,
         scenarios=scenarios,
         datamodule=datamodule,
         experiment_suite=experiment_suite,
@@ -1522,37 +1521,6 @@ def main(args):
         dt=args.dt,
         max_rocof=args.max_rocof
     )
-    
-    reducer = None
-    if args.auto_red or args.red_method != "none":
-        # -- collect snapshots once -----------------------------------------
-        snap = fom_system.collect_random_trajectories(
-            N_traj=6000, return_derivative=True
-        )
-        X, Xdot = snap["X"], snap["dXdt"]
-
-        if args.auto_red:
-            from neural_clbf.dimension_reduction.manager import select_reducer
-            reducer = select_reducer(fom_system, X, Xdot, d_max=args.d_max)
-            print(f"[AutoRed] {reducer.__class__.__name__}"
-                  f"  d={reducer.latent_dim}  γ={getattr(reducer,'gamma',0):.2e}")
-        else:
-            from neural_clbf.dimension_reduction.symplectic_projection import \
-                SymplecticProjectionReducer as SPR
-            from neural_clbf.dimension_reduction.opinf import OpInfReducer
-            from neural_clbf.dimension_reduction.lyap_coherency import \
-                LyapCoherencyReducer as LCR
-
-            if args.red_method == "sp":
-                A,J,R = fom_system.linearise(return_JR=True)
-                reducer = SPR(A,J,R, args.d_max)
-            elif args.red_method == "opinf":
-                reducer = OpInfReducer(args.d_max, fom_system.n_dims)\
-                            .fit(X, Xdot, fom_system.energy_function,
-                                 fom_system.energy_function(X).min())
-            elif args.red_method == "lcr":
-                reducer = LCR(fom_system, 3, X)
-    
     print(f"Created swing equation system with {args.n_nodes} nodes")
     print(f"RoCoF safety limit: {args.max_rocof} Hz/s")
     

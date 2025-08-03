@@ -33,7 +33,6 @@ class CLFController(Controller):
         clf_relaxation_penalty: float = 50.0,
         controller_period: float = 0.01,
         disable_gurobi: bool = True,
-        robust_margin_gamma: float = 0.0,
         cache_size: int = 1000,  # Add caching for better performance
     ):
         """Initialize the controller.
@@ -67,7 +66,7 @@ class CLFController(Controller):
         # Save the other parameters
         self.clf_lambda = clf_lambda
         self.clf_relaxation_penalty = clf_relaxation_penalty
-        self.robust_margin_gamma = robust_margin_gamma
+
         # Initialize cache for computed control inputs
         self.cache = {}
         self.cache_size = cache_size
@@ -100,7 +99,7 @@ class CLFController(Controller):
             constraints.append(
                 Lf_V_params[i]
                 + Lg_V_params[i] @ u
-                + (self.clf_lambda + self.robust_margin_gamma) * V_param
+                + self.clf_lambda * V_param
                 - clf_relaxations[i]
                 <= 0
             )
