@@ -1,15 +1,19 @@
 from __future__ import annotations
 import torch
 import numpy as np
+import warnings
+import logging
 try:
     from control import care
 except ImportError:
     care = None
 from neural_clbf.dimension_reduction.base import BaseReducer
 
+logger = logging.getLogger(__name__)
+
 
 class SymplecticProjectionReducer(BaseReducer):
-    """Fixed SPR with proper handling of dimension mismatches."""
+    """Fixed SPR with guaranteed orthogonality and robust basis selection."""
 
     def __init__(self, A: torch.Tensor, J: torch.Tensor,
                  R: torch.Tensor, latent_dim: int, 
@@ -17,6 +21,10 @@ class SymplecticProjectionReducer(BaseReducer):
         
         if care is None:
             raise ImportError("The 'control' library is required for SymplecticProjectionReducer.")
+        
+        # Ensure even dimension for symplectic structure
+        if latent_dim % 2 != 0:
+            raise ValueError(f"Symplectic projection requires even latent dimension, got {latent_dim}")
             
         super().__init__(latent_dim)
         
@@ -33,14 +41,59 @@ class SymplecticProjectionReducer(BaseReducer):
         self._build_projection(A, J, R, X_data)
    
     def _build_projection(self, A, J, R, X_data=None):
-        """Build projection matrix with dimension mismatch fixes."""
+        """Build projection matrix T such that T^T T = I with symplectic pairing."""
         device = A.device
         dtype = A.dtype
         n_full = A.shape[0]
         
-        print(f"\nBuilding Symplectic Projection (n={n_full} → d={self.latent_dim}):")
+        logger.info(f"\nBuilding Symplectic Projection (n={n_full} → d={self.latent_dim}):")
         
-        # Step 1: Get base symplectic modes from CARE
+        # Step 1: Solve CARE/Lyapunov for P
+        P = self._solve_riccati(A, device, dtype)
+        
+        # Step 2: Build projection basis T
+        if self.enhanced and X_data is not None and X_data.shape[0] > 10:
+            T = self._build_enhanced_basis(P, X_data, device, dtype)
+        else:
+            T = self._build_standard_basis(P, device, dtype)
+        
+        # Step 3: Ensure T has correct dimensions
+        if T.shape != (n_full, self.latent_dim):
+            logger.warning(f"  T shape mismatch. Got {T.shape}, expected ({n_full}, {self.latent_dim})")
+            
+            if T.shape[1] > self.latent_dim:
+                # Too many columns, truncate
+                T = T[:, :self.latent_dim]
+            elif T.shape[1] < self.latent_dim:
+                # Too few columns, pad with orthogonal vectors
+                T = self._pad_basis(T, self.latent_dim, device, dtype)
+
+        # Step 4: Ensure orthogonality using QR decomposition
+        try:
+            T_ortho, _ = torch.linalg.qr(T)
+        except Exception as e:
+             logger.warning(f"  QR decomposition failed: {e}. Using T as-is.")
+             T_ortho = T
+
+        T = T_ortho
+        
+        # Step 5: Compute pseudo-inverse. Since T is orthonormal, Ti = T.T.
+        Ti = T.T
+        
+        # Register buffers
+        self.register_buffer("T", T.detach())
+        self.register_buffer("Ti", Ti.detach())
+        
+        self.gamma = 0.0
+        self._verify_projection()
+        self._verify_symplectic_pairs()
+        
+        # Build reduced-order dynamics
+        self._build_reduced_dynamics()
+
+    def _solve_riccati(self, A, device, dtype):
+        """Solve CARE with robustness improvements"""
+        n_full = A.shape[0]
         A_np = A.cpu().numpy()
         Eye_np = torch.eye(n_full, device=A.device).cpu().numpy()
         
@@ -56,54 +109,21 @@ class SymplecticProjectionReducer(BaseReducer):
             P = torch.as_tensor(P_np, dtype=dtype, device=device)
             
             # Make P positive definite if needed
-            eigvals = torch.linalg.eigvalsh(P)
-            if eigvals.min() < 1e-8:
-                P = P + (1e-8 - eigvals.min()) * torch.eye(n_full, device=device)
+            try:
+                eigvals = torch.linalg.eigvalsh(P)
+                if eigvals.min() < 1e-8:
+                    P = P + (1e-8 - eigvals.min()) * torch.eye(n_full, device=device)
+            except Exception as e:
+                logger.warning(f"  eigvalsh failed ({e}); applying γI fallback")
+                P = P + 1e-8 * torch.eye(n_full, device=device)
                 
         except Exception as e:
-            print(f"  Warning: CARE solver failed: {e}. Using fallback.")
+            logger.warning(f"  CARE solver failed: {e}. Using fallback.")
             # Fallback: use stable Lyapunov solution
             P = self._solve_lyapunov_fallback(A, device, dtype)
         
-        # Step 2: Build projection basis
-        if self.enhanced and X_data is not None and X_data.shape[0] > 10:
-            T = self._build_enhanced_basis(P, X_data, device, dtype)
-        else:
-            T = self._build_standard_basis(P, device, dtype)
-        
-        # Step 3: Ensure T has correct dimensions
-        if T.shape != (n_full, self.latent_dim):
-            print(f"  Warning: T shape mismatch. Got {T.shape}, expected ({n_full}, {self.latent_dim})")
-            
-            if T.shape[1] > self.latent_dim:
-                # Too many columns, truncate
-                T = T[:, :self.latent_dim]
-            elif T.shape[1] < self.latent_dim:
-                # Too few columns, pad with orthogonal vectors
-                T = self._pad_basis(T, self.latent_dim, device, dtype)
-        
-        # Step 4: Ensure orthogonality
-        T, _ = torch.linalg.qr(T)
-        
-        # Step 5: Compute pseudo-inverse
-        try:
-            # Direct pseudo-inverse
-            Ti = torch.linalg.pinv(T, rcond=1e-8)
-        except:
-            # Regularized inverse
-            reg = 1e-10
-            Ti = T.T @ torch.linalg.inv(T @ T.T + reg * torch.eye(n_full, device=device))
-        
-        # Register buffers
-        self.register_buffer("T", T.detach())
-        self.register_buffer("Ti", Ti.detach())
-        
-        # Set gamma (exact for symplectic projection)
-        self.gamma = 0.0
-        
-        # Verify
-        self._verify_projection()
-    
+        return P
+
     def _solve_lyapunov_fallback(self, A, device, dtype):
         """Solve continuous Lyapunov equation as CARE fallback."""
         n = A.shape[0]
@@ -128,7 +148,7 @@ class SymplecticProjectionReducer(BaseReducer):
         return P
     
     def _build_standard_basis(self, P, device, dtype):
-        """Build standard symplectic basis from Riccati solution."""
+        """Build basis by selecting dominant eigenvectors of P. (FIXED)"""
         n_full = P.shape[0]
         
         # Compute eigenvectors of P
@@ -137,45 +157,15 @@ class SymplecticProjectionReducer(BaseReducer):
         # Sort by eigenvalue magnitude (descending)
         idx = torch.argsort(eigvals.abs(), descending=True)
         
-        # Special handling for near-full dimension
-        if self.latent_dim == n_full - 1 and n_full == 19:
-            print("  Special case: 19D → 18D reduction")
-            
-            # Option 1: Remove the mode with smallest eigenvalue
-            T = eigvecs[:, idx[:self.latent_dim]]
-            
-            # Option 2: Remove mode that preserves symplectic structure best
-            # Find the mode whose removal least affects the symplectic form
-            best_removal = -1
-            best_score = float('inf')
-            
-            for i in range(n_full):
-                # Try removing mode i
-                mask = torch.ones(n_full, dtype=torch.bool)
-                mask[idx[i]] = False
-                T_test = eigvecs[:, mask]
-                
-                # Check symplectic preservation
-                if hasattr(self, 'J_symplectic'):
-                    M = T_test.T @ self.J_symplectic @ T_test
-                    skew_error = (M + M.T).norm()
-                    if skew_error < best_score:
-                        best_score = skew_error
-                        best_removal = i
-            
-            if best_removal >= 0:
-                mask = torch.ones(n_full, dtype=torch.bool)
-                mask[idx[best_removal]] = False
-                T = eigvecs[:, idx[mask[:n_full]]]
-        else:
-            # Standard case: take top eigenvectors
-            T = eigvecs[:, idx[:self.latent_dim]]
+        # FIX: Removed flawed special casing for 19->18 dimensions.
+        # Simply take the top eigenvectors corresponding to the largest eigenvalues.
+        T = eigvecs[:, idx[:self.latent_dim]]
         
         return T
     
     def _build_enhanced_basis(self, P, X_data, device, dtype):
-        """Build enhanced basis using trajectory data."""
-        print("  Using data-enhanced basis selection...")
+        """Build enhanced basis with symplectic pairing enforcement."""
+        logger.info("  Using data-enhanced basis with symplectic pairing...")
         
         n_full = P.shape[0]
         
@@ -197,17 +187,67 @@ class SymplecticProjectionReducer(BaseReducer):
         else:
             combined = eigvecs
         
-        # Orthogonalize
+        # Orthogonalize the combined basis
         Q_combined, _ = torch.linalg.qr(combined)
         
-        # Score each mode
-        scores = self._score_modes(Q_combined, X_data)
+        # Build symplectic pairs
+        pairs = []
+        used_indices = set()
         
-        # Select best modes
-        idx = torch.argsort(scores, descending=True)[:self.latent_dim]
-        idx_sorted = torch.sort(idx).values
+        # For each column, try to form a symplectic pair
+        for i in range(Q_combined.shape[1]):
+            if i in used_indices:
+                continue
+                
+            v = Q_combined[:, i]
+            Jv = self.J_symplectic @ v
+            
+            # Find the best matching column for Jv
+            best_match = -1
+            best_similarity = 0.0
+            
+            for j in range(Q_combined.shape[1]):
+                if j == i or j in used_indices:
+                    continue
+                    
+                # Check similarity with existing columns
+                similarity = torch.abs(Q_combined[:, j] @ Jv).item()
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = j
+            
+            # If we found a good match, use it; otherwise, use Jv directly
+            if best_match >= 0 and best_similarity > 0.8:
+                pairs.append((v, Q_combined[:, best_match]))
+                used_indices.add(i)
+                used_indices.add(best_match)
+            else:
+                # Normalize Jv and use it
+                Jv_normalized = Jv / (Jv.norm() + 1e-10)
+                pairs.append((v, Jv_normalized))
+                used_indices.add(i)
         
-        T = Q_combined[:, idx_sorted]
+        # Build final basis respecting dimension budget
+        basis_cols = []
+        for v, Jv in pairs:
+            if len(basis_cols) + 2 > self.latent_dim:
+                break
+            basis_cols.extend([v, Jv])
+        
+        # Update latent_dim if we couldn't achieve the requested dimension
+        achieved_dim = len(basis_cols)
+        if achieved_dim < self.latent_dim:
+            warnings.warn(f"SPR returned d={achieved_dim} (requested {self.latent_dim}) "
+                         f"to preserve symplectic pairs")
+            self.latent_dim = achieved_dim
+        
+        if achieved_dim == 0:
+            raise ValueError("Could not build any symplectic pairs")
+        
+        T = torch.stack(basis_cols, dim=1)
+        
+        # Final orthogonalization to ensure numerical orthogonality
+        T, _ = torch.linalg.qr(T)
         
         return T
     
@@ -281,36 +321,78 @@ class SymplecticProjectionReducer(BaseReducer):
     def _verify_projection(self):
         """Verify projection properties."""
         # Check dimensions
-        print(f"  T shape: {self.T.shape}, Ti shape: {self.Ti.shape}")
+        logger.info(f"  T shape: {self.T.shape}, Ti shape: {self.Ti.shape}")
         
         # Check conditioning
         try:
             cond = torch.linalg.cond(self.T)
-            print(f"  T condition number: {cond:.2e}")
+            logger.info(f"  T condition number: {cond:.2e}")
         except:
-            print("  T condition number: N/A")
-        
-        # Check projection property
-        TTi = self.T @ self.Ti
-        I = torch.eye(self.n_full, device=self.T.device)
-        proj_error = (TTi @ self.T - self.T).norm()
-        print(f"  Projection error: ||T @ Ti @ T - T|| = {proj_error:.2e}")
+            logger.info("  T condition number: N/A")
         
         # Check orthogonality
-        ortho_error = (self.T.T @ self.T - torch.eye(self.latent_dim, device=self.T.device)).norm()
-        print(f"  Orthogonality error: ||T^T @ T - I|| = {ortho_error:.2e}")
-        
-        # Warn if errors are large
-        if proj_error > 1e-6:
-            print("  ⚠️  Warning: Large projection error!")
-        if ortho_error > 1e-6:
-            print("  ⚠️  Warning: T is not orthogonal!")
+        I_d = torch.eye(self.latent_dim, device=self.T.device)
+        ortho_error = (self.T.T @ self.T - I_d).norm()
+        logger.info(f"  Orthogonality error: ||T^T @ T - I|| = {ortho_error:.2e}")
 
-    # BaseReducer API
+        if ortho_error > 1e-5:
+            logger.warning("  ⚠️  CRITICAL: T is not orthogonal!")
+
+        # Check projection property (T @ Ti @ T = T)
+        proj_error = (self.T @ self.Ti @ self.T - self.T).norm()
+        logger.info(f"  Projection error: ||T @ Ti @ T - T|| = {proj_error:.2e}")
+
+    def _verify_symplectic_pairs(self):
+        """Verify symplectic pairing structure."""
+        if self.latent_dim < 2:
+            return
+            
+        max_pair_error = 0.0
+        for i in range(0, self.latent_dim - 1, 2):
+            # Check if T[:, i+1] ≈ J @ T[:, i] (up to normalization)
+            v1 = self.T[:, i]
+            v2 = self.T[:, i+1]
+            Jv1 = self.J_symplectic @ v1
+            
+            # Normalize for comparison
+            Jv1_normalized = Jv1 / (Jv1.norm() + 1e-10)
+            v2_normalized = v2 / (v2.norm() + 1e-10)
+            
+            pair_error = (Jv1_normalized - v2_normalized).norm().item()
+            max_pair_error = max(max_pair_error, pair_error)
+        
+        logger.info(f"  Max symplectic pair error: {max_pair_error:.2e}")
+        if max_pair_error > 1e-3:
+            logger.warning(f"  ⚠️  Warning: Symplectic pairing may not be perfectly preserved")
+
+    def _build_reduced_dynamics(self):
+        """Build reduced-order dynamics that preserve structure."""
+        logger.info("  Building reduced-order dynamics...")
+        
+        # Project system matrices to reduced space
+        self.J_r = self.T.T @ self.J_symplectic @ self.T
+        self.R_r = self.T.T @ self.R @ self.T
+        self.A_r = self.T.T @ self.A @ self.T  # Linearized Hamiltonian
+        
+        # Define reduced ODE
+        def f_red(z, u=None):
+            """Pure reduced ODE: z_dot = A_r @ z"""
+            if z.dim() == 1:
+                z = z.unsqueeze(0)
+            return z @ self.A_r.T
+        
+        self.f_red = f_red
+        
+        # Verify stability of reduced system
+        eigvals_r = torch.linalg.eigvals(self.A_r)
+        max_real_r = eigvals_r.real.max().item()
+        logger.info(f"    Reduced system max Re(λ) = {max_real_r:.3f}")
+
+    # BaseReducer API (Row vector convention: z = x @ T, x = z @ Ti)
     def fit(self, X):
         """Refit with new data."""
         if X is not None and X.shape[0] > 10:
-            print("Refitting SPR with trajectory data...")
+            logger.info("Refitting SPR with trajectory data...")
             self._build_projection(self.A, self.J_symplectic, self.R, X)
         return self
 
@@ -322,16 +404,16 @@ class SymplecticProjectionReducer(BaseReducer):
         return x @ self.T
 
     def inverse(self, z: torch.Tensor) -> torch.Tensor:
-        """Reconstruct from reduced space: x = z @ Ti"""
+        """Reconstruct from reduced space: x = z @ Ti (where Ti = T.T)"""
         if z.dim() == 1:
             z = z.unsqueeze(0)
             return (z @ self.Ti).squeeze(0)
         return z @ self.Ti
 
     def jacobian(self, X: torch.Tensor) -> torch.Tensor:
-        """Return batch Jacobian: J = T^T"""
+        """Return batch Jacobian: J = T.T = Ti"""
         B = X.shape[0] if X.dim() > 1 else 1
-        J = self.T.T.unsqueeze(0)
+        J = self.Ti.unsqueeze(0)
         if B > 1:
             J = J.expand(B, -1, -1)
         return J.contiguous()

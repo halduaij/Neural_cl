@@ -1,14 +1,16 @@
 """
-Reduction validation utilities with stability fixes
-==================================================
-
-Fixed version addressing tensor dimension mismatches and instability issues.
+Fixed rollout_rom and validate_reducer functions that:
+1. Use reducer's own dynamics (f_red) when available
+2. Handle dimension errors in validation
+3. Use consistent dt from system
 """
 
-from __future__ import annotations
 import torch
-from typing import Dict, Literal, Optional, Callable
+import numpy as np
+from typing import Dict, Optional
+import logging
 
+logger = logging.getLogger(__name__)
 
 @torch.no_grad()
 def rollout_rom(

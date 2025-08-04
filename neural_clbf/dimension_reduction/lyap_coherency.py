@@ -1,13 +1,18 @@
 from __future__ import annotations
 import torch, numpy as np
+import warnings
+import logging
 from scipy.cluster.hierarchy import linkage, fcluster
 from neural_clbf.dimension_reduction.base import BaseReducer
 
+logger = logging.getLogger(__name__)
+
 
 class LyapCoherencyReducer(BaseReducer):
-    """Dynamic coherency with explicit Lyapunov energy bound - FIXED VERSION."""
+    """Dynamic coherency reducer with robust clustering and orthonormal projection - FIXED VERSION."""
 
-    def __init__(self, sys, n_groups: int, snaps: torch.Tensor, λ: float = 0.7):
+    def __init__(self, sys, n_groups: int, snaps: torch.Tensor, λ: float = 0.7, 
+                 strict_dim: bool = False):
         # Initialize BaseReducer with proper dimension
         # Account for the fact that actual dimension might be less than 2*n_groups
         max_latent_dim = 2 * sys.n_machines - 1  # Maximum possible dimension
@@ -18,6 +23,7 @@ class LyapCoherencyReducer(BaseReducer):
         self.sys = sys
         self.n_groups = n_groups
         self.requested_groups = n_groups
+        self.strict_dim = strict_dim
         
         # Ensure n_machines attribute exists
         if not hasattr(self.sys, 'n_machines'):
@@ -33,14 +39,14 @@ class LyapCoherencyReducer(BaseReducer):
         N = self.sys.n_machines
         M = torch.as_tensor(self.sys.M, dtype=X.dtype, device=X.device)
         
-        print(f"\nBuilding LyapCoherencyReducer:")
-        print(f"  Machines: {N}, Requested groups: {self.n_groups}")
+        logger.info(f"\nBuilding LyapCoherencyReducer:")
+        logger.info(f"  Machines: {N}, Requested groups: {self.n_groups}")
         
         # Extract angles and velocities from state vector
         try:
             delta_abs = self.sys.state_to_absolute_angles(X)
         except Exception as e:
-            print(f"  Warning: state_to_absolute_angles failed: {e}")
+            logger.warning(f"  state_to_absolute_angles failed: {e}")
             # Fallback: assume first N-1 are relative angles
             delta_abs = torch.zeros(X.shape[0], N, device=X.device)
             if N > 1:
@@ -55,17 +61,17 @@ class LyapCoherencyReducer(BaseReducer):
             try:
                 pot = self.sys.potential_energy_per_machine(delta_abs)
             except Exception as e:
-                print(f"  Warning: potential_energy_per_machine failed: {e}. Using kinetic only.")
+                logger.warning(f"  potential_energy_per_machine failed: {e}. Using kinetic only.")
                 pot = torch.zeros_like(kin)
         else:
-            print("  Warning: potential_energy_per_machine not found. Using kinetic energy only.")
+            logger.warning("  potential_energy_per_machine not found. Using kinetic energy only.")
             pot = torch.zeros_like(kin)
 
         E = kin + pot
         
         # Robustness checks for Energy calculation
         if not torch.isfinite(E).all():
-            print("  Warning: Non-finite energy values detected. Clamping.")
+            logger.warning("  Non-finite energy values detected. Clamping.")
             E = torch.nan_to_num(E, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # Add small noise for numerical stability
@@ -75,11 +81,11 @@ class LyapCoherencyReducer(BaseReducer):
         try:
             corr = torch.corrcoef(E_noisy.T).detach().cpu().numpy()
             if np.isnan(corr).any() or np.isinf(corr).any():
-                print("  Warning: Invalid correlation matrix. Using identity.")
+                logger.warning("  Invalid correlation matrix. Using identity.")
                 corr = np.eye(N)
                 np.fill_diagonal(corr, 1.0)
         except Exception as e:
-            print(f"  Warning: Correlation computation failed: {e}. Using identity.")
+            logger.warning(f"  Correlation computation failed: {e}. Using identity.")
             corr = np.eye(N)
         
         # Compute gap matrix
@@ -109,10 +115,10 @@ class LyapCoherencyReducer(BaseReducer):
                 Z = linkage(D_condensed, "average")
                 labels = fcluster(Z, t=self.n_groups, criterion="maxclust") - 1
             else:
-                print("  Warning: All machines perfectly coherent. Using cyclic grouping.")
+                logger.warning("  All machines perfectly coherent. Using cyclic grouping.")
                 labels = np.arange(N) % self.n_groups
         except Exception as e:
-            print(f"  Clustering failed: {e}. Assigning fallback groups.")
+            logger.error(f"  Clustering failed: {e}. Assigning fallback groups.")
             labels = np.arange(N) % self.n_groups
 
         labels = torch.as_tensor(labels, dtype=torch.long, device=X.device)
@@ -123,14 +129,24 @@ class LyapCoherencyReducer(BaseReducer):
         # Build projection matrix
         self._build_projection_matrix(labels, N, X.device, X.dtype)
         
+        # Check strict dimension requirement
+        requested_dim = 2 * self.n_groups
+        if self.strict_dim and self.latent_dim != requested_dim:
+            raise ValueError(f"Could not achieve requested dimension {requested_dim}, got {self.latent_dim}")
+        elif self.latent_dim != requested_dim:
+            warnings.warn(f"Requested dimension {requested_dim} but achieved {self.latent_dim}")
+        
         # Compute maximum energy deviation for gamma
         self._compute_energy_deviation(X)
         
+        # Build reduced-order dynamics
+        self._build_reduced_dynamics()
+        
         # Print final group assignments
-        print("  Final group assignments:")
+        logger.info("  Final group assignments:")
         for g in range(self.actual_groups):
             machines = torch.where(self.labels == g)[0].tolist()
-            print(f"    Group {g}: machines {machines}")
+            logger.info(f"    Group {g}: machines {machines}")
 
     def _fix_grouping_issues(self, labels, N):
         """Fix reference machine isolation and empty groups."""
@@ -144,7 +160,7 @@ class LyapCoherencyReducer(BaseReducer):
         # Fix 1: Handle reference machine (machine 0) if alone
         machine0_group = labels[0].item()
         if group_counts[machine0_group] == 1:
-            print(f"  Fixing: Machine 0 alone in group {machine0_group}")
+            logger.info(f"  Fixing: Machine 0 alone in group {machine0_group}")
             # Find the group with the most machines
             other_groups = [g for g in range(self.n_groups) if g != machine0_group]
             if other_groups:
@@ -156,7 +172,7 @@ class LyapCoherencyReducer(BaseReducer):
         # Fix 2: Redistribute empty groups
         empty_groups = torch.where(group_counts == 0)[0]
         if len(empty_groups) > 0:
-            print(f"  Found {len(empty_groups)} empty groups. Redistributing...")
+            logger.info(f"  Found {len(empty_groups)} empty groups. Redistributing...")
             
             for empty_g in empty_groups:
                 # Find groups with multiple machines
@@ -187,34 +203,31 @@ class LyapCoherencyReducer(BaseReducer):
         return new_labels
 
     def _build_projection_matrix(self, labels, N, device, dtype):
-        """Build projection matrix ensuring full rank."""
+        """Build orthonormal projection matrix P ensuring full rank."""
         state_dim = 2 * N - 1  # N-1 angles + N frequencies
-        
-        # Actual number of groups after fixing
         n_actual_groups = labels.max().item() + 1
         
-        # Compute actual latent dimension
-        # Each group contributes at most 2 dimensions (angle + frequency)
-        # But groups with only machine 0 contribute only 1 (frequency only)
+        # Determine the actual latent dimension based on group composition
         latent_dim = 0
+        group_has_angle = torch.zeros(n_actual_groups, dtype=torch.bool)
+        
         for g in range(n_actual_groups):
             machines_in_group = torch.where(labels == g)[0]
             if len(machines_in_group) > 0:
-                # Check if group has non-reference machines
-                has_angle_machines = any(m > 0 for m in machines_in_group)
-                if has_angle_machines:
-                    latent_dim += 2  # Both angle and frequency
-                else:
-                    latent_dim += 1  # Only frequency
+                # Angle state exists if any machine i > 0 is present (relative angles theta_1i)
+                if any(m > 0 for m in machines_in_group):
+                    latent_dim += 1
+                    group_has_angle[g] = True
+                # Frequency state always exists for non-empty group
+                latent_dim += 1
         
-        # Ensure we don't exceed state dimension
         latent_dim = min(latent_dim, state_dim)
         self.latent_dim = latent_dim
         self.actual_groups = n_actual_groups
         
-        print(f"  Actual groups: {n_actual_groups}, Latent dimension: {latent_dim}")
+        logger.info(f"  Actual groups: {n_actual_groups}, Latent dimension: {latent_dim}")
         
-        # Build projection matrix P
+        # Build projection matrix P (n x d)
         P = torch.zeros(state_dim, latent_dim, dtype=dtype, device=device)
         
         col_idx = 0
@@ -226,54 +239,43 @@ class LyapCoherencyReducer(BaseReducer):
             if len(idx) == 0:
                 continue
             
-            # Angle component (skip if only contains machine 0)
-            angle_machines = [i.item() for i in idx if i > 0]
-            
-            if angle_machines and col_idx < latent_dim:
-                # Equal weight for all non-reference machines in group
-                weight_angle = 1.0 / np.sqrt(len(angle_machines))
-                for i in angle_machines:
-                    P[i - 1, col_idx] = weight_angle
+            # Angle component
+            if group_has_angle[g]:
+                angle_machines_idx = [i.item() for i in idx if i > 0]
+                # Normalized weight for orthonormality
+                weight_angle = 1.0 / np.sqrt(len(angle_machines_idx))
+                for i in angle_machines_idx:
+                    P[i - 1, col_idx] = weight_angle # Angle state index is i-1
                 col_idx += 1
             
-            # Frequency component (all machines including machine 0)
+            # Frequency component
             if col_idx < latent_dim:
+                # Normalized weight
                 weight_freq = 1.0 / np.sqrt(len(idx))
                 for i in idx:
-                    P[N - 1 + i, col_idx] = weight_freq
+                    P[N - 1 + i, col_idx] = weight_freq # Frequency state index is N-1+i
                 col_idx += 1
         
-        # Verify and fix rank if needed
-        rank = torch.linalg.matrix_rank(P).item()
-        if rank < latent_dim:
-            print(f"  Warning: Initial projection rank {rank} < {latent_dim}. Fixing...")
-            
-            # Use QR decomposition to get orthogonal basis
-            Q, R = torch.linalg.qr(P)
-            P = Q[:, :latent_dim]
-            
-            # Recheck rank
-            rank = torch.linalg.matrix_rank(P).item()
-            print(f"  Fixed projection rank: {rank}")
+        # Ensure Orthogonality
+        # Verify orthogonality (should hold by construction due to disjoint groups and components)
+        ortho_error = (P.T @ P - torch.eye(latent_dim, device=device)).norm()
         
-        # Compute proper pseudo-inverse with regularization
-        reg = 1e-10
-        try:
-            # Method 1: Direct pseudoinverse
-            Pi = torch.linalg.pinv(P, rcond=1e-8)
-        except:
-            # Method 2: Regularized inverse
-            Pi = P.T @ torch.linalg.inv(P @ P.T + reg * torch.eye(state_dim, device=device))
+        if ortho_error > 1e-6:
+            # Enforce via QR if construction failed or numerical issues arose
+            logger.warning(f"  P not orthogonal (error: {ortho_error:.2e}). Enforcing via QR.")
+            P, _ = torch.linalg.qr(P)
+
+        # Pseudo-inverse is the transpose for orthonormal P
+        Pi = P.T
         
         # Store matrices
         self.register_buffer("P", P.detach())
         self.register_buffer("Pi", Pi.detach())
         self.register_buffer("labels", labels.detach())
         
-        # Verify projection properties
-        P_Pi_P = self.P @ self.Pi @ self.P
-        proj_error = (P_Pi_P - self.P).norm()
-        print(f"  Projection verification: ||P @ Pi @ P - P|| = {proj_error:.6e}")
+        # Verification
+        proj_error = (self.P @ self.Pi @ self.P - self.P).norm()
+        logger.info(f"  Projection verification: ||P @ Pi @ P - P|| = {proj_error:.6e}")
 
     def _compute_energy_deviation(self, X):
         """Compute maximum energy deviation for gamma calculation."""
@@ -303,11 +305,147 @@ class LyapCoherencyReducer(BaseReducer):
                 max_dev = state_errors.max()
         
         except Exception as e:
-            print(f"  Energy deviation calculation failed: {e}. Using default.")
+            logger.error(f"  Energy deviation calculation failed: {e}. Using default.")
             max_dev = torch.tensor(0.1, device=X.device)
         
         self.register_buffer("deltaV_max", max_dev)
-        print(f"  Max energy deviation: {max_dev.item():.6e}")
+        logger.info(f"  Max energy deviation: {max_dev.item():.6e}")
+
+    def _build_reduced_dynamics(self):
+        """Build aggregated swing equation dynamics for coherent groups."""
+        logger.info("  Building reduced-order dynamics...")
+        
+        device = self.P.device
+        
+        # Aggregate parameters for each group
+        M_groups = []
+        D_groups = []
+        P_groups = []
+        
+        for g in range(self.actual_groups):
+            machines_in_group = torch.where(self.labels == g)[0]
+            if len(machines_in_group) > 0:
+                # Sum inertias, damping, and mechanical power for the group
+                M_groups.append(self.sys.M[machines_in_group].sum())
+                D_groups.append(self.sys.D[machines_in_group].sum())
+                P_groups.append(self.sys.P_mechanical[machines_in_group].sum())
+        
+        self.M_eq = torch.stack(M_groups).to(device)
+        self.D_eq = torch.stack(D_groups).to(device)
+        self.P_eq = torch.stack(P_groups).to(device)
+        
+        # Project coupling matrix to reduced space
+        # Note: This assumes groups are ordered as [angle1, freq1, angle2, freq2, ...]
+        # We need to extract the angle-angle coupling part
+        B_full = self.sys.B_matrix.to(device)
+        
+        # Build aggregated coupling matrix
+        n_angle_groups = sum(1 for g in range(self.actual_groups) if any(m > 0 for m in torch.where(self.labels == g)[0]))
+        K_agg = torch.zeros(n_angle_groups, n_angle_groups, device=device)
+        
+        angle_group_idx = 0
+        angle_to_group = {}
+        
+        for g in range(self.actual_groups):
+            machines = torch.where(self.labels == g)[0]
+            if any(m > 0 for m in machines):  # Has angle states
+                angle_to_group[g] = angle_group_idx
+                angle_group_idx += 1
+        
+        # Sum coupling between groups
+        for g1 in range(self.actual_groups):
+            if g1 not in angle_to_group:
+                continue
+            machines1 = torch.where(self.labels == g1)[0]
+            
+            for g2 in range(self.actual_groups):
+                if g2 not in angle_to_group:
+                    continue
+                machines2 = torch.where(self.labels == g2)[0]
+                
+                # Sum all couplings between machines in the two groups
+                coupling_sum = 0.0
+                for m1 in machines1:
+                    for m2 in machines2:
+                        coupling_sum += B_full[m1, m2].item()
+                
+                K_agg[angle_to_group[g1], angle_to_group[g2]] = coupling_sum
+        
+        self.K_red = K_agg
+        
+        # Define reduced ODE for aggregated swing equations
+        def f_red(z, u=None):
+            """Aggregated swing equation dynamics."""
+            if z.dim() == 1:
+                z = z.unsqueeze(0)
+            
+            batch_size = z.shape[0]
+            z_dot = torch.zeros_like(z)
+            
+            # Extract angles and frequencies from state
+            # Assuming state is ordered as [θ1, ω1, θ2, ω2, ...]
+            n_groups_with_angles = self.K_red.shape[0]
+            
+            # Map reduced state indices to angle/frequency pairs
+            state_idx = 0
+            angle_indices = []
+            freq_indices = []
+            group_to_freq_idx = {}
+            
+            for g in range(self.actual_groups):
+                if state_idx >= z.shape[1]:
+                    break
+                    
+                if g in angle_to_group:
+                    angle_indices.append(state_idx)
+                    state_idx += 1
+                
+                if state_idx < z.shape[1]:
+                    freq_indices.append(state_idx)
+                    group_to_freq_idx[g] = len(freq_indices) - 1
+                    state_idx += 1
+            
+            if len(angle_indices) > 0:
+                θ = z[:, angle_indices]  # (batch, n_angle_groups)
+                
+                # Compute coupling terms: K_ij * sin(θ_i - θ_j)
+                θ_i = θ.unsqueeze(2)  # (batch, n_angle, 1)
+                θ_j = θ.unsqueeze(1)  # (batch, 1, n_angle)
+                sin_diff = torch.sin(θ_i - θ_j)  # (batch, n_angle, n_angle)
+                
+                K_expanded = self.K_red.unsqueeze(0)  # (1, n_angle, n_angle)
+                coupling_terms = (K_expanded * sin_diff).sum(dim=2)  # (batch, n_angle)
+                
+                # θ_dot = ω (for groups with angles)
+                for i, angle_idx in enumerate(angle_indices):
+                    # Find corresponding frequency
+                    group_idx = [g for g, idx in angle_to_group.items() if idx == i][0]
+                    if group_idx in group_to_freq_idx:
+                        freq_idx = freq_indices[group_to_freq_idx[group_idx]]
+                        z_dot[:, angle_idx] = z[:, freq_idx]
+            
+            # ω_dot = (P - D*ω - coupling) / M
+            ω = z[:, freq_indices]  # (batch, n_freq_groups)
+            
+            for i, (g, freq_local_idx) in enumerate(group_to_freq_idx.items()):
+                freq_idx = freq_indices[freq_local_idx]
+                
+                # Mechanical power and damping
+                ω_dot_i = (self.P_eq[g] - self.D_eq[g] * ω[:, freq_local_idx]) / self.M_eq[g]
+                
+                # Add coupling if this group has angle states
+                if g in angle_to_group:
+                    angle_local_idx = angle_to_group[g]
+                    ω_dot_i = ω_dot_i - coupling_terms[:, angle_local_idx] / self.M_eq[g]
+                
+                z_dot[:, freq_idx] = ω_dot_i
+            
+            return z_dot
+        
+        self.f_red = f_red
+        
+        logger.info(f"    Aggregated {self.sys.n_machines} machines into {self.actual_groups} groups")
+        logger.info(f"    Reduced coupling matrix shape: {self.K_red.shape}")
 
     # BaseReducer API
     def fit(self, x):
@@ -319,7 +457,7 @@ class LyapCoherencyReducer(BaseReducer):
         return x @ self.P
         
     def inverse(self, z: torch.Tensor) -> torch.Tensor:
-        """Reconstruct from latent space: x = z @ Pi"""
+        """Reconstruct from latent space: x = z @ Pi (Pi = P.T)"""
         return z @ self.Pi
     
     def jacobian(self, X: torch.Tensor) -> torch.Tensor:

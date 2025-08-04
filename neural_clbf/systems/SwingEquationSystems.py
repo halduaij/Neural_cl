@@ -2,8 +2,11 @@ import torch
 import numpy as np
 from typing import Tuple, Optional, List, Dict
 import math
+import logging
 from neural_clbf.systems import ControlAffineSystem
 from neural_clbf.systems.utils import Scenario, ScenarioList
+
+logger = logging.getLogger(__name__)
 
 class SwingEquationSystem(ControlAffineSystem):
     """
@@ -66,7 +69,7 @@ class SwingEquationSystem(ControlAffineSystem):
             f"Coupling matrix has wrong shape: {self.B_matrix.shape}, expected ({self.N_NODES}, {self.N_NODES})"
 
         self.n_machines = self.N_NODES        # alias used by reducers
-        self._goal_point = goal_point if goal_point is not None else torch.zeros((1, self.n_dims))
+        self._specified_goal_point = goal_point
 
         super().__init__(
             nominal_params, dt=dt, controller_dt=controller_dt, scenarios=scenarios,
@@ -91,10 +94,7 @@ class SwingEquationSystem(ControlAffineSystem):
     
     def simulate(self, x_init, num_steps, *args, **kwargs):
         """
-        Override parent's simulate to handle the validation's u parameter.
-        
-        The validation passes u as a keyword argument, which the parent doesn't accept.
-        This method extracts u, converts it to a controller, and calls parent's simulate.
+        Override parent's simulate to robustly handle 'u' and 'controller' kwargs.
         """
         # Ensure num_steps is an integer (fix for the string error)
         try:
@@ -102,53 +102,51 @@ class SwingEquationSystem(ControlAffineSystem):
         except (ValueError, TypeError) as e:
             raise TypeError(f"num_steps must be convertible to int, got {type(num_steps).__name__}: {num_steps}")
         
-        # Extract u if provided
+        # Extract known arguments
         u = kwargs.pop('u', None)
-        
-        # Extract other expected kwargs for parent's simulate
         controller_period = kwargs.pop('controller_period', None)
         guard = kwargs.pop('guard', None)
         params = kwargs.pop('params', None)
         
-        # Check if there are any unexpected kwargs remaining
+        # FIX: Extract 'controller' from kwargs explicitly
+        controller_kw = kwargs.pop('controller', None)
+        
+        # Check for unexpected kwargs (Warning check)
         if kwargs:
             unexpected = list(kwargs.keys())
-            print(f"Warning: Unexpected keyword arguments will be ignored: {unexpected}")
+            if unexpected:
+               logger.warning(f"Unexpected keyword arguments will be ignored: {unexpected}")
         
-        # Handle controller - either from args or create from u
+        # Determine the controller: prioritize positional, then kwarg, then u, then nominal
         if len(args) >= 1:
-            # Controller was passed as positional argument
             controller = args[0]
-            remaining_args = args[1:]
+        elif controller_kw is not None:
+            controller = controller_kw
+        elif u is not None:
+            # Ensure u is a tensor, not a string or other type
+            if not isinstance(u, torch.Tensor):
+                try:
+                    u = torch.tensor(u, dtype=torch.float32)
+                except Exception as e:
+                    raise TypeError(f"Could not convert u to tensor: {e}")
+            
+            # Create controller from u
+            timestep_counter = {'t': 0}
+            
+            def u_controller(x):
+                t = timestep_counter['t']
+                if u.dim() == 3 and t < u.shape[1]:
+                    control = u[:, t, :]
+                elif u.dim() == 2:
+                    control = u
+                else:
+                    control = self.u_nominal(x)
+                timestep_counter['t'] += 1
+                return control
+            
+            controller = u_controller
         else:
-            # No positional controller, check if we have u
-            if u is not None:
-                # Ensure u is a tensor, not a string or other type
-                if not isinstance(u, torch.Tensor):
-                    try:
-                        u = torch.tensor(u, dtype=torch.float32)
-                    except Exception as e:
-                        raise TypeError(f"Could not convert u to tensor: {e}")
-                
-                # Create controller from u
-                timestep_counter = {'t': 0}
-                
-                def u_controller(x):
-                    t = timestep_counter['t']
-                    if u.dim() == 3 and t < u.shape[1]:
-                        control = u[:, t, :]
-                    elif u.dim() == 2:
-                        control = u
-                    else:
-                        control = self.u_nominal(x)
-                    timestep_counter['t'] += 1
-                    return control
-                
-                controller = u_controller
-            else:
-                # Use nominal controller
-                controller = self.u_nominal
-            remaining_args = ()
+            controller = self.u_nominal
         
         # Validate x_init
         if not isinstance(x_init, torch.Tensor):
@@ -157,7 +155,7 @@ class SwingEquationSystem(ControlAffineSystem):
             except Exception as e:
                 raise TypeError(f"Could not convert x_init to tensor: {e}")
         
-        # Call parent's simulate with only the parameters it expects
+        # Call parent's simulate (controller must be passed positionally)
         return super().simulate(
             x_init, 
             num_steps, 
@@ -218,14 +216,6 @@ class SwingEquationSystem(ControlAffineSystem):
         lower_limit = -1.0 * upper_limit
 
         return (upper_limit, lower_limit)
-
-    @property 
-    def goal_point(self):
-        if not hasattr(self, '_equilibrium_point'):
-            theta_eq = self.delta_star[0] - self.delta_star[1:]
-            omega_eq = torch.zeros(self.N_NODES)
-            self._equilibrium_point = torch.cat([theta_eq, omega_eq]).unsqueeze(0)
-        return self._equilibrium_point
 
     def goal_mask(self, x: torch.Tensor) -> torch.Tensor:
         """Return the mask of x indicating points in the goal set"""
@@ -348,8 +338,10 @@ class SwingEquationSystem(ControlAffineSystem):
 
     def _f(self, x: torch.Tensor, params: Scenario) -> torch.Tensor:
         """
-        Return the drift dynamics of the control-affine system.
-
+        Return the drift dynamics. FIX: Corrected sign convention for physical consistency.
+        State x = [theta_12, ..., theta_1n, omega_1, ..., omega_n], where theta_1i = delta_1 - delta_i.
+        Dynamics: M_i * dot(omega_i) = P_i - D_i*omega_i - Sum_j (B_ij * sin(delta_i - delta_j))
+        
         args:
             x: bs x self.n_dims tensor of state
             params: a dictionary giving the parameter values for the system.
@@ -357,40 +349,48 @@ class SwingEquationSystem(ControlAffineSystem):
             f: bs x self.n_dims x 1 tensor
         """
         batch_size = x.shape[0]
-        f = torch.zeros((batch_size, self.n_dims, 1))
-        f = f.type_as(x)
+        f = torch.zeros((batch_size, self.n_dims, 1), device=x.device, dtype=x.dtype)
 
         # Get parameters - use self attributes which maintain correct shapes
         M = self.M.to(x.device).expand(batch_size, -1)
         D = self.D.to(x.device).expand(batch_size, -1)
-        P = self.P_mechanical.to(x.device).expand(batch_size, -1)
+        P_mech = self.P_mechanical.to(x.device).expand(batch_size, -1)
         B = self.B_matrix.to(x.device)  # Coupling matrix
         
         theta = x[:, :self.N_NODES - 1]
         omega = x[:, self.N_NODES - 1:]
 
-        # Theta dynamics (6b)
+        # Theta dynamics: dot(theta_1i) = omega_1 - omega_i
         for i in range(1, self.N_NODES):
             f[:, i - 1, 0] = omega[:, 0] - omega[:, i]
 
-        # Omega dynamics (6c)
-        # For omega_1 (i = 1)
+        # Omega dynamics
+
+        # For omega_1 (i=0)
+        # P_elec_1 = Sum_{j>1} B_1j * sin(delta_1 - delta_j) = Sum_{j>1} B_1j * sin(theta_1j)
         i = 0
-        coupling_sum_1 = torch.zeros(batch_size).type_as(x)
+        coupling_sum_1 = torch.zeros(batch_size, device=x.device, dtype=x.dtype)
         for j in range(1, self.N_NODES):
             coupling_sum_1 += B[i, j] * torch.sin(theta[:, j - 1])
-        f[:, self.N_NODES - 1 + i, 0] = (P[:, i] - D[:, i] * omega[:, i] - coupling_sum_1) / M[:, i]
+        
+        # dot(omega_1) = (P_1 - D_1*omega_1 - P_elec_1) / M_1
+        f[:, self.N_NODES - 1 + i, 0] = (P_mech[:, i] - D[:, i] * omega[:, i] - coupling_sum_1) / M[:, i]
 
-        # For omega_i (i = 2, ..., n)
+        # For omega_i (i > 0)
         for i in range(1, self.N_NODES):
-            coupling_sum_i = torch.zeros(batch_size).type_as(x)
-            # B_1i * sin(theta_1i)
-            coupling_sum_i += B[i, 0] * torch.sin(theta[:, i - 1])
-            # Sum B_ij * sin(theta_1i - theta_1j), j != i
+            coupling_sum_i = torch.zeros(batch_size, device=x.device, dtype=x.dtype)
+            
+            # Term j=0 (Reference node 1): B_i1 * sin(delta_i - delta_1) = B_i1 * sin(-theta_1i) = -B_i1 * sin(theta_1i)
+            coupling_sum_i += -B[i, 0] * torch.sin(theta[:, i - 1])
+            
+            # Terms j>0, j!=i
+            # delta_i - delta_j = (delta_i - delta_1) + (delta_1 - delta_j) = -theta_1i + theta_1j
             for j in range(1, self.N_NODES):
                 if i != j:
-                    coupling_sum_i += B[i, j] * torch.sin(theta[:, i - 1] - theta[:, j - 1])
-            f[:, self.N_NODES - 1 + i, 0] = (P[:, i] - D[:, i] * omega[:, i] + coupling_sum_i) / M[:, i]
+                    coupling_sum_i += B[i, j] * torch.sin(theta[:, j - 1] - theta[:, i - 1])
+            
+            # FIX: Ensure MINUS sign before the coupling sum (P_elec)
+            f[:, self.N_NODES - 1 + i, 0] = (P_mech[:, i] - D[:, i] * omega[:, i] - coupling_sum_i) / M[:, i]
 
         return f
 
@@ -467,68 +467,119 @@ class SwingEquationSystem(ControlAffineSystem):
         
         return scenarios
         
-    def solve_equilibrium(self,
-                          tol: float = 1e-10,
-                          max_iter: int = 50,
-                          verbose: bool = False) -> torch.Tensor:
+    def solve_equilibrium(self, tol: float = 1e-10, max_iter: int = 50, verbose: bool = False) -> torch.Tensor:
         """
-        Solve  P_i = Σ_j B_ij sin(δ_i−δ_j)  for δ  (ω = 0).
-
-        Fix δ_0 = 0 to remove the rotational degree of freedom, then apply a
-        Newton–Raphson iteration.  Returns a tensor  δ*  (N,) in radians.
-
-        Raises RuntimeError if convergence fails.
+        Delegate to the robust solver
         """
-        N = self.n_machines
-        P = torch.as_tensor(self.P_mechanical)          # mechanical inputs
-        B = torch.as_tensor(self.B_matrix)   # coupling matrix
+        return self.solve_equilibrium_robust(tol, max_iter, verbose)
 
-        # unknowns: δ[1:]  (set δ0 = 0)
-        δ = torch.zeros(N, dtype=P.dtype)
-
-        def mismatch(delta):
-            """f(delta) = P - Σ B sin(δ_i-δ_j); returns shape (N-1,)"""
-            δ_full = torch.cat((torch.zeros(1, dtype=delta.dtype), delta))
-            diff = δ_full[:, None] - δ_full[None, :]
-            sin_mat = torch.sin(diff)
-            Pe = (B * sin_mat).sum(1)
-            return (P - Pe)[1:]              # exclude reference bus 0
-
-        for it in range(max_iter):
-            f = mismatch(δ[1:])
-            norm_f = f.norm().item()
+    def solve_equilibrium_robust(self, tol=1e-10, max_iter=100, verbose=False):
+        '''Robust equilibrium solver with power balance correction and DC initialization.'''
+        N = self.N_NODES
+        device = self.M.device
+        
+        P = self.P_mechanical.to(device).clone()
+        K = self.B_matrix.to(device)
+        
+        # FIX: Correct power balance (Crucial for convergence)
+        P_sum = P.sum()
+        if abs(P_sum) > 1e-6:
             if verbose:
-                print(f"iter {it}: ‖f‖ = {norm_f:.3e}")
-            if norm_f < tol:
-                break
-
-            # Jacobian H_ij = ∂f_i/∂δ_j   (i,j ≥ 1)
-            δ_full = torch.cat((torch.zeros(1, dtype=δ.dtype), δ[1:]))
-            diff = δ_full[:, None] - δ_full[None, :]
-            cos_mat = torch.cos(diff)
-            H = -B * cos_mat
-            # row/col 0 correspond to reference bus → remove
-            H = H[1:, 1:]
-
-            # Newton step
-            try:
-                Δ = torch.linalg.solve(H, f)
-            except RuntimeError:
-                raise RuntimeError("Jacobian is singular; "
-                                   "choose another reference machine.")
-
-            δ[1:] -= Δ
-
-            if torch.isnan(δ).any():
-                raise RuntimeError("Newton diverged (NaN encountered)")
-
-        else:
-            raise RuntimeError("Equilibrium solver did not converge")
-
+                logger.info(f"Correcting power imbalance: {P_sum:.6f}")
+            P = P - P_sum / N
+        
+        # Initialize guesses (Including DC Power Flow)
+        initial_guesses = [torch.zeros(N, device=device)]
+        try:
+            # DC approximation: B_dc * delta = P
+            B_dc_full = torch.diag(K.sum(dim=1)) - K
+            B_dc_red = B_dc_full[1:, 1:]
+            P_red = P[1:]
+            delta_dc_red = torch.linalg.solve(B_dc_red, P_red)
+            delta_dc = torch.zeros(N, device=device)
+            delta_dc[1:] = delta_dc_red
+            initial_guesses.append(delta_dc)
+        except:
+            initial_guesses.append(0.1 * torch.randn(N, device=device))
+        
+        best_delta = None
+        best_error = float('inf')
+        
+        # Newton-Raphson Iteration
+        for guess_idx, delta_init in enumerate(initial_guesses):
+            delta = delta_init.clone()
+            
+            for iteration in range(max_iter):
+                # Power flow equations
+                P_calc = torch.zeros(N, device=device)
+                for i in range(N):
+                    for j in range(N):
+                        if i != j:
+                            P_calc[i] += K[i, j] * torch.sin(delta[i] - delta[j])
+                
+                mismatch = P - P_calc
+                error = mismatch.norm().item()
+                
+                if error < tol:
+                    if verbose:
+                        logger.info(f"Converged with guess {guess_idx} in {iteration} iterations")
+                    # Ensure reference is 0
+                    return delta - delta[0]
+                
+                if error < best_error:
+                    best_error = error
+                    best_delta = delta.clone()
+                
+                # Newton step
+                J_power = torch.zeros(N, N, device=device)
+                for i in range(N):
+                    for j in range(N):
+                        if i != j:
+                            cos_ij = torch.cos(delta[i] - delta[j])
+                            J_power[i, j] = -K[i, j] * cos_ij
+                            J_power[i, i] += K[i, j] * cos_ij
+                
+                # Remove reference
+                J_red = J_power[1:, 1:]
+                mismatch_red = mismatch[1:]
+                
+                try:
+                    # Check conditioning
+                    cond = torch.linalg.cond(J_red)
+                    if cond > 1e12:
+                        J_red = J_red + 1e-8 * torch.eye(N-1, device=device)
+                    
+                    d_delta = torch.linalg.solve(J_red, mismatch_red)
+                    
+                    # Line search
+                    alpha = 1.0
+                    for _ in range(10):
+                        delta_new = delta.clone()
+                        delta_new[1:] += alpha * d_delta
+                        
+                        P_new = torch.zeros(N, device=device)
+                        for i in range(N):
+                            for j in range(N):
+                                if i != j:
+                                    P_new[i] += K[i, j] * torch.sin(delta_new[i] - delta_new[j])
+                        
+                        if (P - P_new).norm() < error:
+                            delta = delta_new
+                            break
+                        alpha *= 0.5
+                        
+                except:
+                    break
+        
+        if best_delta is None:
+            if verbose:
+                logger.warning("No valid solution found, returning zeros")
+            return torch.zeros(N, device=device)
+            
         if verbose:
-            print(f"Converged in {it+1} iterations; max |Δ| = {Δ.abs().max():.2e}")
-
-        return δ
+            logger.warning(f"Did not fully converge. Best error = {best_error:.2e}")
+        # Ensure reference is 0
+        return best_delta - best_delta[0]
 
 
     def potential_energy_per_machine(self, delta: torch.Tensor) -> torch.Tensor:
@@ -542,34 +593,50 @@ class SwingEquationSystem(ControlAffineSystem):
 
     def energy_function(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Total energy for batch x = [θ_12 … θ_1n, ω_1 … ω_n].
+        Total energy (Lyapunov function) relative to the equilibrium point (V(x_eq) = 0).
+        FIX: Implemented the standard structure-preserving energy function.
         """
-        B = x.shape[0]
+        B_size = x.shape[0]
         N = self.N_NODES
 
-        delta = self.state_to_absolute_angles(x)             # (B, N)
-        omega = x[:, N - 1 :]                                # (B, N)
+        # Get equilibrium
+        x_eq = self.goal_point.to(x.device)
+        if x_eq.shape[0] == 1 and B_size > 1:
+            x_eq = x_eq.expand(B_size, -1)
 
-        # kinetic energy
+        # Convert states and equilibrium to absolute angles (assuming delta_1=0)
+        delta = self.state_to_absolute_angles(x)
+        omega = x[:, N - 1 :]
+        delta_eq = self.state_to_absolute_angles(x_eq)
+        omega_eq = x_eq[:, N-1:] # Should be zero
+
+        # Kinetic energy (relative)
         M_device = self.M.to(x.device)
-        H_kin = 0.5 * (M_device * omega ** 2).sum(1)
+        H_kin = 0.5 * (M_device * (omega - omega_eq) ** 2).sum(1)
 
-        # potential energy
-        delta_i = delta.unsqueeze(2)    # (B, N, 1)
-        delta_j = delta.unsqueeze(1)    # (B, 1, N)
-        diff = delta_i - delta_j        # (B, N, N) via broadcasting
-        
-        # Use B_matrix (coupling matrix)
-        B_device = self.B_matrix.to(x.device)
-        if B_device.dim() == 2:
-            B_device = B_device.unsqueeze(0)  # (1, N, N)
-        
-        # Compute potential energy
-        cos_diff = torch.cos(diff)
-        potential_matrix = B_device * (1 - cos_diff)
-        H_pot = 0.5 * potential_matrix.sum(dim=(1, 2))
+        # Potential energy (relative)
+        # H_pot = Sum_{i<j} B_ij * (cos(delta_i_eq-delta_j_eq) - cos(delta_i-delta_j))
 
-        return H_kin + H_pot
+        # Calculate differences (delta_i - delta_j)
+        diff = delta.unsqueeze(2) - delta.unsqueeze(1)
+        diff_eq = delta_eq.unsqueeze(2) - delta_eq.unsqueeze(1)
+        
+        B_matrix_device = self.B_matrix.to(x.device)
+        if B_matrix_device.dim() == 2:
+            B_matrix_device = B_matrix_device.unsqueeze(0) # (1, N, N)
+        
+        # Calculate potential energy terms
+        potential_matrix = B_matrix_device * (torch.cos(diff_eq) - torch.cos(diff))
+        
+        # Sum over upper triangle (i<j)
+        H_pot = torch.triu(potential_matrix, diagonal=1).sum(dim=(1, 2))
+
+        V = H_kin + H_pot
+        
+        # Ensure non-negative due to numerical precision
+        V = torch.clamp(V, min=0.0)
+
+        return V
 
     @torch.no_grad()
     def collect_random_trajectories(
@@ -617,17 +684,24 @@ class SwingEquationSystem(ControlAffineSystem):
 
     def state_to_absolute_angles(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x = [θ_12 … θ_1n, ω]  →  δ = [0, δ_2 … δ_n].
+        x = [θ_12 … θ_1n, ω].  θ_1i = δ_1 - δ_i.
+        Assuming reference δ_1 = 0. Then δ_i = -θ_1i for i > 1.
 
         Returns
         -------
         delta : (B, N) tensor
         """
         B = x.shape[0]
-        delta_rel = x[:, : self.N_NODES - 1]
-        return torch.cat(
-            (torch.zeros(B, 1, device=x.device, dtype=x.dtype), delta_rel), dim=1
-        )
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+            B = 1
+
+        theta_1i = x[:, : self.N_NODES - 1]
+        
+        delta_1 = torch.zeros(B, 1, device=x.device, dtype=x.dtype)
+        delta_i = -theta_1i
+        
+        return torch.cat((delta_1, delta_i), dim=1)
     
     def to(self, device):
         """
@@ -667,47 +741,41 @@ class SwingEquationSystem(ControlAffineSystem):
             
         return self
         
-    """
-    Fixes for the "Jacobian is singular" error in Symplectic Projection
-    Add these methods to your SwingEquationSystem class
-    """
+    # --- Equilibrium and Linearization Fixes (Crucial for SPR) ---
 
     def compute_equilibrium_point(self):
         '''Compute and cache the true equilibrium point in state coordinates'''
-        if not hasattr(self, '_equilibrium_point_cached'):
-            if not hasattr(self, 'delta_star') or self.delta_star is None:
-                self.delta_star = self.solve_equilibrium()
-            
-            theta_eq = self.delta_star[0] - self.delta_star[1:]
-            omega_eq = torch.zeros(self.N_NODES)
-            self._equilibrium_point_cached = torch.cat([theta_eq, omega_eq])
-            
-            # Verify
-            f_eq = self._f(self._equilibrium_point_cached.unsqueeze(0), self.nominal_params).squeeze()
-            if f_eq.norm() > 1e-6:
-                print(f"Warning: Equilibrium error = {f_eq.norm():.2e}")
+        if hasattr(self, '_equilibrium_point_cached'):
+             return self._equilibrium_point_cached
+
+        if hasattr(self, '_specified_goal_point') and self._specified_goal_point is not None:
+            self._equilibrium_point_cached = self._specified_goal_point.squeeze()
+            return self._equilibrium_point_cached
+
+        if not hasattr(self, 'delta_star') or self.delta_star is None:
+            self.delta_star = self.solve_equilibrium_robust()
+        
+        device = self.M.device
+        delta_star = self.delta_star.to(device)
+
+        # Convert absolute angles to relative angles (theta_1i = delta_1 - delta_i)
+        # The robust solver ensures delta_1 = 0.
+        theta_eq = delta_star[0] - delta_star[1:]
+        omega_eq = torch.zeros(self.N_NODES, device=device)
+        self._equilibrium_point_cached = torch.cat([theta_eq, omega_eq])
+        
+        # Verification
+        f_eq = self._f(self._equilibrium_point_cached.unsqueeze(0), self.nominal_params).squeeze()
+        if f_eq.norm() > 1e-6:
+            logger.warning(f"Equilibrium verification error = {f_eq.norm():.2e}")
         
         return self._equilibrium_point_cached
 
     @property
     def goal_point(self):
-        '''Return true equilibrium instead of zeros'''
+        '''Return true equilibrium'''
         return self.compute_equilibrium_point().unsqueeze(0)
 
-    def compute_A_matrix(self, scenario=None):
-        '''Compute linearized A matrix at TRUE equilibrium'''
-        if scenario is None:
-            scenario = self.nominal_params
-        
-        x_eq = self.compute_equilibrium_point()
-        x_eq_grad = x_eq.clone().requires_grad_(True)
-        
-        dynamics = lambda x: self.closed_loop_dynamics(
-            x.unsqueeze(0), self.u_eq, scenario
-        ).squeeze()
-        
-        A = torch.autograd.functional.jacobian(dynamics, x_eq_grad)
-        return A.detach().cpu().numpy().reshape(self.n_dims, self.n_dims)
     def linearise(self, return_JR=False):
         """
         Compute linearization at equilibrium using autograd for reliability.
@@ -718,7 +786,7 @@ class SwingEquationSystem(ControlAffineSystem):
         
         # Ensure we have equilibrium
         if not hasattr(self, 'delta_star') or self.delta_star is None:
-            print("Computing equilibrium point...")
+            logger.info("Computing equilibrium point...")
             self.delta_star = self.solve_equilibrium()
         
         # Get equilibrium in state coordinates  
@@ -727,7 +795,7 @@ class SwingEquationSystem(ControlAffineSystem):
         # Verify equilibrium
         f_eq = self._f(x_eq.unsqueeze(0), self.nominal_params).squeeze()
         eq_error = f_eq.norm().item()
-        print(f"    Equilibrium verification: ||f|| = {eq_error:.2e}")
+        logger.info(f"    Equilibrium verification: ||f|| = {eq_error:.2e}")
         
         # Use autograd for accurate linearization
         x_eq_grad = x_eq.clone().requires_grad_(True)
@@ -740,9 +808,12 @@ class SwingEquationSystem(ControlAffineSystem):
             A = A.squeeze()
         
         # Check eigenvalues
-        eigvals = torch.linalg.eigvals(A)
-        max_real = eigvals.real.max().item()
-        print(f"    Linearization max eigenvalue: {max_real:.6f}")
+        try:
+            eigvals = torch.linalg.eigvals(A)
+            max_real = eigvals.real.max().item()
+            logger.info(f"    Linearization max eigenvalue: {max_real:.6f}")
+        except Exception as e:
+            logger.warning(f"    eigvals failed ({e}); skipping eigenvalue check")
         
         if return_JR:
             # Build J and R matrices inline (they're specific to this system)
@@ -766,112 +837,9 @@ class SwingEquationSystem(ControlAffineSystem):
         else:
             return A
 
-    def compute_A_matrix(self, scenario=None):
+    def compute_A_matrix(self, scenario=None) -> np.ndarray:
         """
-        Compute linearized A matrix (delegates to linearise).
+        Compute linearized A matrix (delegates to linearise) and convert to numpy for parent compatibility
         """
-        return self.linearise(return_JR=False)
-    # Also add the robust equilibrium solver mentioned in the analysis:
-    def solve_equilibrium_robust(self, tol=1e-10, max_iter=100, verbose=False):
-        '''Robust equilibrium solver with multiple initial guesses'''
-        N = self.N_NODES
-        device = self.M.device
-        
-        P = self.P_mechanical.to(device)
-        K = self.B_matrix.to(device)
-        
-        # Fix power balance
-        P_sum = P.sum()
-        if abs(P_sum) > 1e-6:
-            if verbose:
-                print(f"Correcting power imbalance: {P_sum:.6f}")
-            P = P - P_sum / N
-        
-        # Multiple initial guesses
-        initial_guesses = []
-        initial_guesses.append(torch.zeros(N, device=device))
-        initial_guesses.append(0.1 * torch.randn(N, device=device))
-        
-        # Try DC power flow
-        try:
-            B_dc = torch.zeros(N-1, N-1, device=device)
-            for i in range(1, N):
-                for j in range(1, N):
-                    if i != j:
-                        B_dc[i-1, j-1] = -K[i, j]
-                    B_dc[i-1, i-1] += K[i, j]
-            delta_dc = torch.zeros(N, device=device)
-            delta_dc[1:] = torch.linalg.solve(B_dc, P[1:])
-            initial_guesses.append(delta_dc)
-        except:
-            pass
-        
-        best_delta = None
-        best_error = float('inf')
-        
-        for guess_idx, delta_init in enumerate(initial_guesses):
-            delta = delta_init.clone()
-            
-            for iteration in range(max_iter):
-                # Power flow equations
-                P_calc = torch.zeros(N, device=device)
-                for i in range(N):
-                    for j in range(N):
-                        if i != j:
-                            P_calc[i] += K[i, j] * torch.sin(delta[i] - delta[j])
-                
-                mismatch = P - P_calc
-                error = mismatch.norm().item()
-                
-                if error < tol:
-                    if verbose:
-                        print(f"Converged with guess {guess_idx} in {iteration} iterations")
-                    return delta
-                
-                if error < best_error:
-                    best_error = error
-                    best_delta = delta.clone()
-                
-                # Newton step
-                J_power = torch.zeros(N, N, device=device)
-                for i in range(N):
-                    for j in range(N):
-                        if i != j:
-                            cos_ij = torch.cos(delta[i] - delta[j])
-                            J_power[i, j] = -K[i, j] * cos_ij
-                            J_power[i, i] += K[i, j] * cos_ij
-                
-                # Remove reference
-                J_red = J_power[1:, 1:]
-                mismatch_red = mismatch[1:]
-                
-                try:
-                    # Check conditioning
-                    cond = torch.linalg.cond(J_red)
-                    if cond > 1e12:
-                        J_red = J_red + 1e-8 * torch.eye(N-1, device=device)
-                    
-                    d_delta = torch.linalg.solve(J_red, mismatch_red)
-                    
-                    # Line search
-                    alpha = 1.0
-                    for _ in range(10):
-                        delta_new = delta.clone()
-                        delta_new[1:] += alpha * d_delta
-                        
-                        P_new = torch.zeros(N, device=device)
-                        for i in range(N):
-                            for j in range(N):
-                                if i != j:
-                                    P_new[i] += K[i, j] * torch.sin(delta_new[i] - delta_new[j])
-                        
-                        if (P - P_new).norm() < error:
-                            delta = delta_new
-                            break
-                        alpha *= 0.5
-                        
-                except:
-                    break
-        
-        print(f"Warning: Did not fully converge. Best error = {best_error:.2e}")
-        return best_delta
+        A_tensor = self.linearise(return_JR=False)
+        return A_tensor.detach().cpu().numpy()

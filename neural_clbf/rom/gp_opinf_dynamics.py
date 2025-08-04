@@ -1,357 +1,250 @@
-from __future__ import annotations
-import torch, itertools
-from torch import nn
+import torch
+import torch.nn as nn
 import numpy as np
+import logging
 
+logger = logging.getLogger(__name__)
 
 class GPOpInfDynamics(nn.Module):
-    """Operator inference latent ODE with guaranteed stability and robustness."""
-
-    def __init__(self, d: int, m: int = 1):
+    """
+    Robust Operator Inference Dynamics with optional quadratic terms.
+    Learns z_dot = A z + B u + H (z⊗z) + C.
+    """
+    def __init__(self, d, m, include_quadratic: bool = False, reg: float = 0.0):
         super().__init__()
         self.d = d
         self.m = m
+        self.include_quadratic = include_quadratic
         
-        # Initialize with strongly stable diagonal matrix
-        self.A = nn.Parameter(-0.5 * torch.eye(d), requires_grad=False)
-        self.B = nn.Parameter(torch.zeros(d, m), requires_grad=False)
+        # Initialize A with stability bias (critical damping ≈ 0.1 s⁻¹)
+        self.A = nn.Parameter(torch.eye(d) * -0.1) 
+        self.B = nn.Parameter(torch.zeros(d, m)) if m > 0 else None
+        self.C = nn.Parameter(torch.zeros(d))
         
-        # Quadratic terms setup
-        comb = list(itertools.combinations_with_replacement(range(d), 2))
-        self.register_buffer("_comb", torch.tensor(comb, dtype=torch.long))
+        # Quadratic term H: d x (d*(d+1)/2) for symmetric z⊗z
+        if include_quadratic:
+            n_quad = d * (d + 1) // 2
+            self.H = nn.Parameter(torch.zeros(d, n_quad))
+        else:
+            self.H = None
         
-        # H (quadratic terms) - keep zero for power system stability
-        self.H = nn.Parameter(torch.zeros(d, len(comb)), requires_grad=False)
-        
-        # Track fitting metrics
-        self.register_buffer("residual", torch.tensor(1.0))
-        self.register_buffer("condition_number", torch.tensor(1.0))
-        self.register_buffer("spectral_radius", torch.tensor(0.5))
-        
-        # Regularization and stability parameters
-        self.register_buffer("reg", torch.tensor(0.1))
-        self.stability_margin = 0.5
-        self.max_spectral_radius = 0.95  # For discrete stability
-        self.disable_threshold = 0.99   # Threshold to recommend disabling
-
-    def _q(self, z):
-        """Quadratic terms (disabled for stability)."""
-        return torch.zeros(z.shape[0], len(self._comb), device=z.device)
+        self.register_buffer("reg", torch.tensor(reg))
+        self.residual = torch.tensor(float('inf'))
+        self.model_order = "linear"  # Will be updated based on fitting
 
     def forward(self, z, u=None):
-        """
-        Compute latent dynamics dz/dt = Az + Bu with stability checks.
-        """
-        if z.dim() == 1:
+        if z.dim() == 1: 
             z = z.unsqueeze(0)
         
-        # Clamp input to prevent numerical issues
-        z_max = 1e4
-        if z.abs().max() > z_max:
-            z = torch.clamp(z, -z_max, z_max)
-        
-        # Check for NaN/Inf
-        if not torch.isfinite(z).all():
-            z = torch.nan_to_num(z, nan=0.0, posinf=z_max, neginf=-z_max)
-        
         # Linear dynamics
-        out = z @ self.A.T
+        z_dot = z @ self.A.T + self.C
         
-        # Control term
-        if u is not None and self.m > 0:
-            if u.dim() == 1:
+        # Control input
+        if self.B is not None:
+            if u is None:
+                u = torch.zeros(z.shape[0], self.m, device=z.device)
+            elif u.dim() == 1:
                 u = u.unsqueeze(0)
-            if u.shape[0] == 1 and z.shape[0] > 1:
-                u = u.expand(z.shape[0], -1)
-            
-            # Clamp control
-            u = torch.clamp(u, -z_max, z_max)
-            out = out + u @ self.B.T
+            if u.shape[1] == self.m:
+                z_dot += u @ self.B.T
         
-        # Final clamping
-        out = torch.clamp(out, -z_max, z_max)
+        # Quadratic dynamics
+        if self.H is not None and self.include_quadratic:
+            z_kron = self._compute_symmetric_kronecker(z)
+            z_dot += z_kron @ self.H.T
         
-        return out
+        return z_dot
 
-    @torch.no_grad()
+    def _compute_symmetric_kronecker(self, z):
+        """Compute symmetric Kronecker product [z_i*z_j for i<=j]"""
+        batch_size = z.shape[0]
+        d = z.shape[1]
+        
+        # Create symmetric product efficiently
+        idx = 0
+        z_kron = torch.zeros(batch_size, d * (d + 1) // 2, device=z.device)
+        for i in range(d):
+            for j in range(i, d):
+                if i == j:
+                    z_kron[:, idx] = z[:, i] * z[:, j]
+                else:
+                    z_kron[:, idx] = 2.0 * z[:, i] * z[:, j]  # Factor of 2 for off-diagonal
+                idx += 1
+        
+        return z_kron
+
     def fit(self, Z, U, dZdt):
         """
-        Fit dynamics with multiple stability guarantees.
+        Fit dynamics using robust Ridge Regression with automatic fallback.
         """
+        logger.info(f"Fitting OpInf dynamics (d={self.d}, quadratic={self.include_quadratic})")
         device = Z.device
-        N, d = Z.shape
+        N = Z.shape[0]
+
+        # 1. Construct Data Matrix D = [Z, U, Z⊗Z, 1]
+        D_list = [Z]
+        if self.m > 0 and U is not None:
+            D_list.append(U)
         
-        print(f"\nFitting OpInf dynamics (d={d}):")
+        # Decide whether to include quadratic terms
+        n_params_linear = self.d + (self.m if self.m > 0 else 0) + 1
+        n_params_quad = n_params_linear
         
-        # 1. Data validation and preprocessing
-        Z, dZdt, U, valid_mask = self._preprocess_data(Z, dZdt, U)
+        if self.include_quadratic:
+            n_params_quad += self.d * (self.d + 1) // 2
+            
+            # Data sufficiency check
+            if N < 5 * n_params_quad:
+                logger.warning(f"  Insufficient data for quadratic model: {N} samples < 5*{n_params_quad} params")
+                logger.warning(f"  Falling back to linear model only")
+                self.include_quadratic = False
+                self.H = None
         
-        if valid_mask.sum() < 2 * d:
-            print("  Warning: Insufficient valid data. Using default stable dynamics.")
-            self._set_default_stable_dynamics(device)
+        # Add quadratic terms if still enabled
+        if self.include_quadratic:
+            Z_kron = self._compute_symmetric_kronecker(Z)
+            D_list.append(Z_kron)
+            self.model_order = "quadratic"
+        
+        # Add constant term
+        D_list.append(torch.ones(N, 1, device=device))
+        D = torch.cat(D_list, dim=1)
+        
+        # 2. Preprocessing - Remove NaNs/Infs
+        valid_mask = torch.isfinite(D).all(dim=1) & torch.isfinite(dZdt).all(dim=1)
+        D_clean = D[valid_mask]
+        Y_clean = dZdt[valid_mask]
+        N_valid = D_clean.shape[0]
+
+        logger.info(f"  Valid samples: {N_valid}/{N} ({(N_valid/N if N>0 else 0)*100:.1f}%)")
+
+        if N_valid < D_clean.shape[1] + 1:
+            logger.error(f"  Insufficient valid data: {N_valid} < {D_clean.shape[1] + 1}")
+            self._set_fallback_dynamics(device)
             return
-        
-        # 2. Robust regression with multiple methods
-        A_fitted, B_fitted, fit_metrics = self._robust_regression(Z, dZdt, U)
-        
-        # 3. Stability analysis and enforcement
-        A_stable = self._enforce_stability(A_fitted, device)
-        
-        # 4. Final verification
-        self._verify_and_finalize(A_stable, B_fitted, Z, dZdt, U, device)
-        
-        # 5. Print summary
-        self._print_fit_summary()
 
-    def _preprocess_data(self, Z, dZdt, U):
-        """Robust data preprocessing with outlier detection."""
-        device = Z.device
-        
-        # Check for NaN/Inf
-        valid_mask = torch.isfinite(Z).all(dim=1) & torch.isfinite(dZdt).all(dim=1)
-        
-        if U is not None:
-            valid_mask &= torch.isfinite(U).all(dim=1)
-        
-        # Outlier detection using IQR method
-        Z_valid = Z[valid_mask]
-        dZdt_valid = dZdt[valid_mask]
-        
-        if Z_valid.shape[0] > 10:
-            # Compute IQR for each dimension
-            q1 = torch.quantile(Z_valid, 0.25, dim=0)
-            q3 = torch.quantile(Z_valid, 0.75, dim=0)
-            iqr = q3 - q1
-            
-            # Flag outliers
-            lower_bound = q1 - 3 * iqr
-            upper_bound = q3 + 3 * iqr
-            
-            outlier_mask = ((Z_valid < lower_bound) | (Z_valid > upper_bound)).any(dim=1)
-            outlier_mask |= ((dZdt_valid < -100) | (dZdt_valid > 100)).any(dim=1)
-            
-            # Update valid mask
-            valid_indices = torch.where(valid_mask)[0]
-            valid_mask[valid_indices[outlier_mask]] = False
-        
-        print(f"  Valid samples: {valid_mask.sum()}/{len(Z)} ({valid_mask.float().mean():.1%})")
-        
-        # Extract valid data
-        Z_fit = Z[valid_mask]
-        dZdt_fit = dZdt[valid_mask]
-        U_fit = U[valid_mask] if U is not None else None
-        
-        return Z_fit, dZdt_fit, U_fit, valid_mask
+        # 3. Center the data (but don't normalize)
+        D_mean = D_clean.mean(dim=0, keepdim=True)
+        D_centered = D_clean - D_mean
+        Y_mean = Y_clean.mean(dim=0, keepdim=True) 
+        Y_centered = Y_clean - Y_mean
 
-    def _robust_regression(self, Z, dZdt, U):
-        """Perform robust regression with multiple methods."""
-        device = Z.device
-        d = self.d
-        
-        # Build data matrix
-        if U is not None and self.m > 0:
-            Phi = torch.cat([Z, U], dim=1)
-        else:
-            Phi = Z
-        
-        # Method 1: Ridge regression via normal equations
-        try:
-            reg_matrix = self.reg * torch.eye(Phi.shape[1], device=device)
-            
-            # Add stronger regularization for near-singular cases
-            gram_matrix = Phi.T @ Phi
-            cond = torch.linalg.cond(gram_matrix)
-            if cond > 1e6:
-                print(f"  High condition number ({cond:.1e}), increasing regularization")
-                reg_matrix *= max(1, cond / 1e6)
-            
-            theta = torch.linalg.solve(gram_matrix + reg_matrix, Phi.T @ dZdt)
-            
-            A_fitted = theta[:d].T
-            B_fitted = theta[d:].T if U is not None else None
-            
-            method = "Ridge (normal equations)"
-            
-        except Exception as e:
-            print(f"  Normal equations failed: {e}")
-            
-            # Method 2: SVD-based pseudoinverse
-            try:
-                U_svd, S_svd, Vt_svd = torch.linalg.svd(Phi, full_matrices=False)
-                
-                # Truncate small singular values
-                tol = 1e-8 * S_svd[0]
-                rank = (S_svd > tol).sum().item()
-                
-                if rank < Phi.shape[1]:
-                    print(f"  Rank deficient: {rank}/{Phi.shape[1]}")
-                
-                # Damped pseudoinverse
-                S_inv = S_svd / (S_svd**2 + self.reg)
-                theta = Vt_svd.T[:, :rank] @ (torch.diag(S_inv[:rank]) @ (U_svd.T[:rank] @ dZdt))
-                
-                A_fitted = theta[:d].T
-                B_fitted = theta[d:].T if U is not None and theta.shape[0] > d else None
-                
-                method = "SVD (truncated)"
-                
-            except Exception as e2:
-                print(f"  SVD failed: {e2}. Using diagonal dynamics.")
-                A_fitted = -0.5 * torch.eye(d, device=device)
-                B_fitted = torch.zeros(d, self.m, device=device) if U is not None else None
-                method = "Fallback (diagonal)"
-        
-        # Compute fit metrics
-        predictions = Z @ A_fitted.T
-        if B_fitted is not None and U is not None:
-            predictions += U @ B_fitted.T
-        
-        residuals = (dZdt - predictions).norm(dim=1)
-        
-        metrics = {
-            'method': method,
-            'residual_mean': residuals.mean().item(),
-            'residual_max': residuals.max().item(),
-            'condition_number': cond.item() if 'cond' in locals() else float('inf')
-        }
-        
-        print(f"  Regression method: {method}")
-        print(f"  Mean residual: {metrics['residual_mean']:.3e}")
-        
-        return A_fitted, B_fitted, metrics
+        # 4. Compute adaptive regularization
+        sigma_D = D_centered.std(dim=0).mean()
+        lambda_reg = max(self.reg.item(), 1e-3 * sigma_D.item())
+        logger.info(f"  Data scale σ_D = {sigma_D:.2e}, regularization λ = {lambda_reg:.2e}")
 
-    def _enforce_stability(self, A, device):
-        """Enforce stability through multiple methods."""
-        print("\n  Enforcing stability...")
+        # 5. Ridge Regression
+        DTD = D_centered.T @ D_centered
+        DTY = D_centered.T @ Y_centered
         
-        # Method 1: Check continuous stability
+        # Apply scaled regularization
+        reg_matrix = lambda_reg * torch.eye(DTD.shape[0], device=device)
+        A_ridge = DTD + reg_matrix
+
+        # Check condition number
         try:
-            eigvals = torch.linalg.eigvals(A)
-            max_real = eigvals.real.max().item()
-            print(f"    Continuous: max Re(λ) = {max_real:.4f}")
-            
-            if max_real > -self.stability_margin:
-                # Shift eigenvalues
-                shift = max_real + self.stability_margin
-                A = A - shift * torch.eye(self.d, device=device)
-                print(f"    Shifted by {shift:.4f}")
-                
-                # Recompute
-                eigvals = torch.linalg.eigvals(A)
-                max_real = eigvals.real.max().item()
-                print(f"    After shift: max Re(λ) = {max_real:.4f}")
-                
-        except Exception as e:
-            print(f"    Eigenvalue computation failed: {e}")
-            # Fallback: make strongly diagonal
-            A = -self.stability_margin * torch.eye(self.d, device=device)
-        
-        # Method 2: Check discrete stability (for Euler integration)
-        dt = 0.01  # Standard timestep
-        A_discrete = torch.eye(self.d, device=device) + dt * A
-        
-        try:
-            rho = torch.linalg.eigvals(A_discrete).abs().max().item()
-            print(f"    Discrete: ρ(I + dt*A) = {rho:.6f} (dt={dt})")
-            
-            if rho >= self.max_spectral_radius:
-                # Scale to ensure stability
-                scale = (self.max_spectral_radius - 1) / (rho - 1) * 0.95  # Safety factor
-                A = scale * A
-                print(f"    Scaled by {scale:.4f}")
-                
-                # Final check
-                A_discrete = torch.eye(self.d, device=device) + dt * A
-                rho = torch.linalg.eigvals(A_discrete).abs().max().item()
-                print(f"    Final: ρ(I + dt*A) = {rho:.6f}")
-                
-                # Store for diagnostics
-                self.spectral_radius = torch.tensor(rho)
-                
-        except Exception as e:
-            print(f"    Discrete check failed: {e}")
-            # Conservative fallback
-            A = -self.stability_margin * torch.eye(self.d, device=device)
-            self.spectral_radius = torch.tensor(0.95)
-        
-        # Method 3: Lyapunov stability (optional)
-        try:
-            # Check if A + A^T < 0 (sufficient for stability)
-            symmetric_part = 0.5 * (A + A.T)
-            min_eig = torch.linalg.eigvalsh(symmetric_part).max().item()
-            
-            if min_eig >= 0:
-                print(f"    Symmetric part not negative definite (max eig: {min_eig:.4f})")
-                # Add negative diagonal to ensure stability
-                A = A - (min_eig + 0.1) * torch.eye(self.d, device=device)
-                
+            cond_number = torch.linalg.cond(A_ridge).item()
+            logger.info(f"  Condition number (Ridge): {cond_number:.2e}")
         except:
-            pass
-        
-        return A
+            cond_number = float('inf')
 
-    def _verify_and_finalize(self, A, B, Z, dZdt, U, device):
-        """Final verification and setup."""
-        # Set the fitted parameters
-        self.A.data = A
-        if B is not None:
-            self.B.data = torch.clamp(B, -10.0, 10.0)  # Limit control influence
-        
-        # Compute final residual
-        predictions = self.forward(Z, U)
-        residuals = (dZdt - predictions).norm(dim=1)
-        
-        # Use robust statistics
-        self.residual = torch.quantile(residuals, 0.95)
-        
-        # Store condition number
-        self.condition_number = torch.linalg.cond(self.A)
-        
-        # Final stability check
-        dt = 0.01
-        A_discrete = torch.eye(self.d, device=device) + dt * self.A
-        self.spectral_radius = torch.linalg.eigvals(A_discrete).abs().max()
-        
-        # Recommendation check
-        if self.spectral_radius > self.disable_threshold:
-            print("\n  ⚠️  WARNING: Dynamics may be unstable!")
-            print(f"     Spectral radius {self.spectral_radius:.6f} > {self.disable_threshold}")
-            print("     Consider disabling learned dynamics for this latent dimension.")
+        try:
+            # Attempt direct solve
+            X_T_centered = torch.linalg.solve(A_ridge, DTY)
+            
+            # Account for centering: X_full includes the offset for constant term
+            X_T = X_T_centered.clone()
+            # The constant term needs adjustment for centering
+            offset_correction = Y_mean.T - (X_T_centered.T @ D_mean.unsqueeze(-1)).squeeze(-1)
+            
+            if not torch.isfinite(X_T).all() or not torch.isfinite(offset_correction).all():
+                raise ValueError("NaN/Inf detected in Ridge solution")
 
-    def _set_default_stable_dynamics(self, device):
-        """Set default stable dynamics."""
-        self.A.data = -self.stability_margin * torch.eye(self.d, device=device)
-        self.B.data = torch.zeros(self.d, self.m, device=device)
-        self.residual = torch.tensor(1.0, device=device)
-        self.spectral_radius = torch.tensor(
-            1 - self.stability_margin * 0.01, device=device
-        )  # For dt=0.01
+            X = X_T.T 
+            logger.info(f"  Regression successful: Ridge (direct solve)")
 
-    def _print_fit_summary(self):
-        """Print fitting summary."""
-        print("\n  Dynamics Summary:")
-        print(f"    Residual (95%): {self.residual.item():.3e}")
-        print(f"    Condition number: {self.condition_number.item():.1e}")
-        print(f"    Spectral radius: {self.spectral_radius.item():.6f}")
+        except Exception as e:
+            # Fallback to SVD-based solver
+            logger.warning(f"  Direct solve failed: {e}. Using SVD-based lstsq")
+            try:
+                # Use original (uncentered) data for lstsq
+                solution = torch.linalg.lstsq(D_clean, Y_clean, rcond=1e-6, driver='gelsd')
+                X_T = solution.solution
+                
+                if not torch.isfinite(X_T).all():
+                    raise ValueError("NaN/Inf in lstsq solution")
+                    
+                X = X_T.T
+                offset_correction = None  # lstsq handles offset internally
+                logger.info(f"  Regression successful: Least squares (SVD)")
+                
+            except Exception as e_svd:
+                logger.error(f"  CRITICAL: All regression methods failed: {e_svd}")
+                self._set_fallback_dynamics(device)
+                return
+
+        # 6. Extract and assign parameters
+        self._assign_parameters(X, offset_correction)
         
-        # Stability assessment
-        if self.spectral_radius < 0.95:
-            print("    ✓ STABLE")
-        elif self.spectral_radius < 0.99:
-            print("    ⚠️  MARGINALLY STABLE")
+        # 7. Calculate residual on clean data
+        Y_pred = D_clean @ X_T
+        residuals = (Y_clean - Y_pred).norm(dim=1)
+        residuals_finite = residuals[torch.isfinite(residuals)]
+        
+        if residuals_finite.numel() > 0:
+            self.residual = torch.quantile(residuals_finite, 0.95)
+            mean_res = residuals_finite.mean().item()
+            logger.info(f"  Mean residual: {mean_res:.4e}, 95th percentile: {self.residual:.4e}")
         else:
-            print("    ✗ UNSTABLE")
+            self.residual = torch.tensor(float('inf'))
+            logger.warning(f"  Could not compute residuals")
 
-    def to(self, device):
-        """Move all tensors to device."""
-        super().to(device)
-        self._comb = self._comb.to(device)
-        self.residual = self.residual.to(device)
-        self.reg = self.reg.to(device)
-        self.condition_number = self.condition_number.to(device)
-        self.spectral_radius = self.spectral_radius.to(device)
-        return self
-    
-    def is_stable(self, dt=0.01):
-        """Check if the dynamics are stable for given timestep."""
-        return self.spectral_radius.item() < self.max_spectral_radius
+        # 8. Final stability check on learned A
+        try:
+            eigvals_A = torch.linalg.eigvals(self.A)
+            max_real = eigvals_A.real.max().item()
+            logger.info(f"  Learned A: max Re(λ) = {max_real:.3f}")
+        except:
+            logger.warning(f"  Could not verify eigenvalues of learned A")
+
+    def _assign_parameters(self, X, offset_correction=None):
+        """Extract parameters from regression solution matrix X"""
+        col_idx = 0
+        
+        # Linear term A
+        self.A.data = X[:, col_idx:col_idx + self.d]
+        col_idx += self.d
+        
+        # Control term B
+        if self.B is not None:
+            self.B.data = X[:, col_idx:col_idx + self.m]
+            col_idx += self.m
+        
+        # Quadratic term H
+        if self.H is not None and self.include_quadratic:
+            n_quad = self.d * (self.d + 1) // 2
+            self.H.data = X[:, col_idx:col_idx + n_quad]
+            col_idx += n_quad
+        
+        # Constant term C
+        if offset_correction is not None:
+            self.C.data = offset_correction.squeeze()
+        else:
+            self.C.data = X[:, col_idx].squeeze()
+
+    def _set_fallback_dynamics(self, device):
+        """Set physically reasonable fallback dynamics."""
+        # Use light damping appropriate for power systems
+        zeta = 0.05  # 0.05 s⁻¹ damping (reduced from 0.1)
+        self.A.data = -zeta * torch.eye(self.d, device=device)
+        
+        if self.B is not None:
+            self.B.data.zero_()
+        if self.H is not None:
+            self.H.data.zero_()
+        self.C.data.zero_()
+        
+        self.residual = torch.tensor(float('inf'))
+        self.model_order = "fallback"
+        logger.warning(f"  Using fallback dynamics: A = -{zeta}*I")
