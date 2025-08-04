@@ -7,7 +7,11 @@ Fixed version addressing tensor dimension mismatches and instability issues.
 
 from __future__ import annotations
 import torch
+import logging
 from typing import Dict, Literal, Optional, Callable
+
+# FIX: Add logger definition
+logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -219,7 +223,7 @@ def validate_reducer(
     # Compute metrics
     errors = (full_traj - rom_traj).norm(dim=-1)  # (B, T)
     
-    # Ensure errors is 2D
+    # FIX: Ensure errors is 2D for all subsequent operations
     if errors.dim() == 1:
         errors = errors.unsqueeze(0)
     
@@ -252,13 +256,16 @@ def validate_reducer(
         energy_error = torch.tensor(0.0, device=device)
         eps_E = 1e-8
     
-    # Success rate calculation with dimension safety
+    # Success rate calculation with dimension safety - FIX: handle 1D case
     if errors.shape[0] > 0 and errors.shape[1] > 1:
         final_errors = errors[:, -1]  # (B,)
         
-        # Initial error for threshold
+        # Initial error for threshold - FIX: handle short trajectories
         T_initial = min(10, errors.shape[1])
-        initial_errors = errors[:, :T_initial].mean(dim=1)  # (B,)
+        if errors.dim() == 1:
+            initial_errors = errors[:T_initial].mean().unsqueeze(0)
+        else:
+            initial_errors = errors[:, :T_initial].mean(dim=1)  # (B,)
         
         # Success threshold
         avg_initial_error = initial_errors.mean().item()

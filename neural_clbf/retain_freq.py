@@ -140,7 +140,7 @@ def test_trajectory_preservation():
     V_min = V_fn(X_train).min().item()
     
     # Test parameters
-    T_horizon = 2.0  # 5 second simulation
+    T_horizon = 2.0  # 2 second simulation
     dt = 0.01
     n_test_trajectories = 5
     
@@ -166,6 +166,7 @@ def test_trajectory_preservation():
     
     # Test 1: Symplectic Projection (d=18)
     print("\n1. Testing Symplectic Projection (d=18):")
+    spr = None
     try:
         A, J, R = sys.linearise(return_JR=True)
         spr = SymplecticProjectionReducer(A, J, R, 18)
@@ -179,8 +180,8 @@ def test_trajectory_preservation():
             # Full system trajectory
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
-            # Reduced system trajectory
-            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), T_horizon, dt)
+            # Reduced system trajectory - FIX: correct parameter order and use integer steps
+            traj_rom = rollout_rom(sys, spr, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -212,6 +213,7 @@ def test_trajectory_preservation():
     
     # Test 2: OpInf with d=19
     print("\n2. Testing OpInf (d=19, full dimension):")
+    opinf = None
     try:
         opinf = OpInfReducer(19, 19, sys.n_controls)
         opinf.sys = sys
@@ -225,8 +227,8 @@ def test_trajectory_preservation():
             # Full system trajectory
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
-            # Reduced system trajectory
-            traj_rom = rollout_rom(opinf, sys, x0.unsqueeze(0), T_horizon, dt)
+            # Reduced system trajectory - FIX: correct parameter order and use integer steps
+            traj_rom = rollout_rom(sys, opinf, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -258,6 +260,7 @@ def test_trajectory_preservation():
     
     # Test 3: Lyapunov Coherency (k=9)
     print("\n3. Testing Lyapunov Coherency (k=9 groups → d=18):")
+    lcr = None
     try:
         lcr = LyapCoherencyReducer(sys, 9, X_train)
         lcr.full_dim = 19
@@ -270,8 +273,8 @@ def test_trajectory_preservation():
             # Full system trajectory
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
-            # Reduced system trajectory
-            traj_rom = rollout_rom(lcr, sys, x0.unsqueeze(0), T_horizon, dt)
+            # Reduced system trajectory - FIX: correct parameter order and use integer steps
+            traj_rom = rollout_rom(sys, lcr, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -309,46 +312,33 @@ def test_trajectory_preservation():
     validation_results = {}
     
     for name, reducer in [
-        ('SPR-18', spr if 'spr' in locals() else None),
-        ('OpInf-19', opinf if 'opinf' in locals() else None),
-        ('LCR-18', lcr if 'lcr' in locals() else None)
+        ('SPR-18', spr if spr is not None else None),
+        ('OpInf-19', opinf if opinf is not None else None),
+        ('LCR-18', lcr if lcr is not None else None)
     ]:
         if reducer is None:
             continue
             
         print(f"\nValidating {name}:")
         try:
-
-
-            def sample_near_equilibrium(n_samples):
-                x_eq = sys.goal_point.squeeze()
-                x0 = x_eq.unsqueeze(0).repeat(n_samples, 1)
-                x0 += 0.1 * torch.randn_like(x0)  # 10% perturbation
-                return x0
-
-            # Monkey-patch the sampling
-            original_sample = sys.sample_state_space
-            sys.sample_state_space = sample_near_equilibrium
-
+            # FIX: Use correct parameters
             val_metrics = validate_reducer(
                 sys, reducer, 
                 n_rollouts=50,
-                horizon=2.0,
-                dt=0.01,
-                input_mode="zero"
+                t_sim=2.0,  # FIX: correct parameter name
+                dt=0.01
+                # Removed input_mode parameter that doesn't exist
             )
 
-            # Restore original
-            sys.sample_state_space = original_sample
             validation_results[name] = val_metrics
             print(f"  Mean error: {val_metrics['mean_error']:.6e}")
             print(f"  Max error: {val_metrics['max_error']:.6e}")
-            print(f"  Relative error: {val_metrics['relative_error']:.3%}")
             print(f"  Energy error: {val_metrics['energy_error']:.6e}")
             print(f"  Success rate: {val_metrics['success_rate']:.1%}")
             
         except Exception as e:
             print(f"  Validation failed: {e}")
+            validation_results[name] = {'error': str(e)}
     
     # Summary
     print("\n" + "="*80)
@@ -382,9 +372,9 @@ def test_trajectory_preservation():
     
     for idx, (name, reducer) in enumerate([
         ('Full System', None),
-        ('SPR-18', spr if 'spr' in locals() else None),
-        ('OpInf-19', opinf if 'opinf' in locals() else None),
-        ('LCR-18', lcr if 'lcr' in locals() else None)
+        ('SPR-18', spr if spr is not None else None),
+        ('OpInf-19', opinf if opinf is not None else None),
+        ('LCR-18', lcr if lcr is not None else None)
     ]):
         if name != 'Full System' and reducer is None:
             continue
@@ -393,7 +383,8 @@ def test_trajectory_preservation():
         if name == 'Full System':
             traj = simulate_trajectory(sys, x0_plot, T_horizon, dt)
         else:
-            traj = rollout_rom(reducer, sys, x0_plot.unsqueeze(0), T_horizon, dt)
+            # FIX: correct parameter order and use integer steps
+            traj = rollout_rom(sys, reducer, x0_plot.unsqueeze(0), int(T_horizon/dt), dt=dt)
         
         t = np.arange(traj.shape[1]) * dt
         
@@ -463,22 +454,27 @@ def test_trajectory_preservation():
     plt.savefig('full_dimension_trajectories.png', dpi=150)
     print("\nTrajectory plots saved to 'full_dimension_trajectories.png'")
 
-    # Add this import at the top of retain_freq.py
-    from neural_clbf.reducer_diagnostic import run_full_diagnostic
+    # Check if diagnostic module is available
+    try:
+        from neural_clbf.reducer_diagnostic import run_full_diagnostic
+        
+        print("\n" + "="*80)
+        print("RUNNING DETAILED DIAGNOSTIC")
+        print("="*80)
 
-    # Then at the end of test_trajectory_preservation(), add:
-    print("\n" + "="*80)
-    print("RUNNING DETAILED DIAGNOSTIC")
-    print("="*80)
-
-    # Run diagnostic on the reducers we created
-    run_full_diagnostic(
-        sys, 
-        spr=spr if 'spr' in locals() else None,
-        opinf=opinf if 'opinf' in locals() else None,
-        lcr=lcr if 'lcr' in locals() else None,
-        X_train=X_train
-    )
+        # Run diagnostic on the reducers we created
+        run_full_diagnostic(
+            sys, 
+            spr=spr if spr is not None else None,
+            opinf=opinf if opinf is not None else None,
+            lcr=lcr if lcr is not None else None,
+            X_train=X_train
+        )
+    except ImportError:
+        print("\n" + "="*80)
+        print("DIAGNOSTIC MODULE NOT AVAILABLE")
+        print("="*80)
+        print("Skipping detailed diagnostic - module not found")
     
     return results, validation_results
 

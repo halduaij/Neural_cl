@@ -148,7 +148,7 @@ class SymplecticProjectionReducer(BaseReducer):
         return P
     
     def _build_standard_basis(self, P, device, dtype):
-        """Build basis by selecting dominant eigenvectors of P. (FIXED)"""
+        """Build basis by selecting dominant eigenvectors of P and ensuring symplectic pairs."""
         n_full = P.shape[0]
         
         # Compute eigenvectors of P
@@ -157,14 +157,43 @@ class SymplecticProjectionReducer(BaseReducer):
         # Sort by eigenvalue magnitude (descending)
         idx = torch.argsort(eigvals.abs(), descending=True)
         
-        # FIX: Removed flawed special casing for 19->18 dimensions.
-        # Simply take the top eigenvectors corresponding to the largest eigenvalues.
-        T = eigvecs[:, idx[:self.latent_dim]]
+        # FIX: Build symplectic pairs properly
+        basis = []
+        used_indices = set()
+        
+        for i in idx:
+            if i.item() in used_indices:
+                continue
+            if len(basis) >= self.latent_dim:
+                break
+                
+            # Take eigenvector
+            v = eigvecs[:, i]
+            # Compute symplectic partner
+            Jv = self.J_symplectic @ v
+            Jv = Jv / (Jv.norm() + 1e-12)
+            
+            # Check if we have room for the pair
+            if len(basis) + 2 <= self.latent_dim:
+                basis.extend([v, Jv])
+                used_indices.add(i.item())
+            else:
+                # Can't fit the pair, stop
+                break
+        
+        if len(basis) < self.latent_dim:
+            logger.warning(f"  Could only build {len(basis)} basis vectors (requested {self.latent_dim})")
+            self.latent_dim = len(basis)
+        
+        T = torch.stack(basis, dim=1)
+        
+        # Orthogonalize to ensure numerical stability
+        T, _ = torch.linalg.qr(T)
         
         return T
     
     def _build_enhanced_basis(self, P, X_data, device, dtype):
-        """Build enhanced basis with symplectic pairing enforcement."""
+        """Build enhanced basis with symplectic pairing enforcement - FIXED VERSION."""
         logger.info("  Using data-enhanced basis with symplectic pairing...")
         
         n_full = P.shape[0]
@@ -190,52 +219,20 @@ class SymplecticProjectionReducer(BaseReducer):
         # Orthogonalize the combined basis
         Q_combined, _ = torch.linalg.qr(combined)
         
-        # Build symplectic pairs
-        pairs = []
-        used_indices = set()
-        
-        # For each column, try to form a symplectic pair
-        for i in range(Q_combined.shape[1]):
-            if i in used_indices:
-                continue
-                
-            v = Q_combined[:, i]
+        # FIX: Build proper symplectic pairs after QR
+        basis = []
+        for col in range(0, Q_combined.shape[1] - 1, 2):
+            v = Q_combined[:, col]
             Jv = self.J_symplectic @ v
+            Jv = Jv / (Jv.norm() + 1e-12)
             
-            # Find the best matching column for Jv
-            best_match = -1
-            best_similarity = 0.0
-            
-            for j in range(Q_combined.shape[1]):
-                if j == i or j in used_indices:
-                    continue
-                    
-                # Check similarity with existing columns
-                similarity = torch.abs(Q_combined[:, j] @ Jv).item()
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_match = j
-            
-            # If we found a good match, use it; otherwise, use Jv directly
-            if best_match >= 0 and best_similarity > 0.8:
-                pairs.append((v, Q_combined[:, best_match]))
-                used_indices.add(i)
-                used_indices.add(best_match)
-            else:
-                # Normalize Jv and use it
-                Jv_normalized = Jv / (Jv.norm() + 1e-10)
-                pairs.append((v, Jv_normalized))
-                used_indices.add(i)
-        
-        # Build final basis respecting dimension budget
-        basis_cols = []
-        for v, Jv in pairs:
-            if len(basis_cols) + 2 > self.latent_dim:
+            # Accept the pair only if we stay within latent_dim
+            if len(basis) + 2 > self.latent_dim:
                 break
-            basis_cols.extend([v, Jv])
+            basis.extend([v, Jv])
         
         # Update latent_dim if we couldn't achieve the requested dimension
-        achieved_dim = len(basis_cols)
+        achieved_dim = len(basis)
         if achieved_dim < self.latent_dim:
             warnings.warn(f"SPR returned d={achieved_dim} (requested {self.latent_dim}) "
                          f"to preserve symplectic pairs")
@@ -244,7 +241,7 @@ class SymplecticProjectionReducer(BaseReducer):
         if achieved_dim == 0:
             raise ValueError("Could not build any symplectic pairs")
         
-        T = torch.stack(basis_cols, dim=1)
+        T = torch.stack(basis, dim=1)
         
         # Final orthogonalization to ensure numerical orthogonality
         T, _ = torch.linalg.qr(T)
@@ -366,13 +363,26 @@ class SymplecticProjectionReducer(BaseReducer):
             logger.warning(f"  ⚠️  Warning: Symplectic pairing may not be perfectly preserved")
 
     def _build_reduced_dynamics(self):
-        """Build reduced-order dynamics that preserve structure."""
+        """Build reduced-order dynamics that preserve structure with STABILITY FIX."""
         logger.info("  Building reduced-order dynamics...")
         
         # Project system matrices to reduced space
         self.J_r = self.T.T @ self.J_symplectic @ self.T
         self.R_r = self.T.T @ self.R @ self.T
         self.A_r = self.T.T @ self.A @ self.T  # Linearized Hamiltonian
+        
+        # FIX: Stabilize A_r right after it is built
+        eigvals = torch.linalg.eigvals(self.A_r)
+        max_real = eigvals.real.max().item()
+        if max_real > -0.02:  # margin 20 mrad/s
+            shift = max_real + 0.05
+            self.A_r = self.A_r - shift * torch.eye(self.latent_dim, device=self.A_r.device)
+            logger.info(f"    Stabilized A_r: shifted eigenvalues by -{shift:.3f}")
+            
+            # Verify stability after shift
+            eigvals_new = torch.linalg.eigvals(self.A_r)
+            max_real_new = eigvals_new.real.max().item()
+            logger.info(f"    New max Re(λ) = {max_real_new:.3f}")
         
         # Define reduced ODE
         def f_red(z, u=None):
@@ -383,10 +393,7 @@ class SymplecticProjectionReducer(BaseReducer):
         
         self.f_red = f_red
         
-        # Verify stability of reduced system
-        eigvals_r = torch.linalg.eigvals(self.A_r)
-        max_real_r = eigvals_r.real.max().item()
-        logger.info(f"    Reduced system max Re(λ) = {max_real_r:.3f}")
+        logger.info(f"    Reduced system max Re(λ) = {eigvals.real.max().item():.3f}")
 
     # BaseReducer API (Row vector convention: z = x @ T, x = z @ Ti)
     def fit(self, X):
@@ -431,4 +438,10 @@ class SymplecticProjectionReducer(BaseReducer):
             self.J_symplectic = self.J_symplectic.to(device)
         if hasattr(self, 'R'):
             self.R = self.R.to(device)
+        if hasattr(self, 'A_r'):
+            self.A_r = self.A_r.to(device)
+        if hasattr(self, 'J_r'):
+            self.J_r = self.J_r.to(device)
+        if hasattr(self, 'R_r'):
+            self.R_r = self.R_r.to(device)
         return self

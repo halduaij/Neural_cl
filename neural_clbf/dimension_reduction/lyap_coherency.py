@@ -203,7 +203,7 @@ class LyapCoherencyReducer(BaseReducer):
         return new_labels
 
     def _build_projection_matrix(self, labels, N, device, dtype):
-        """Build orthonormal projection matrix P ensuring full rank."""
+        """Build orthonormal projection matrix P ensuring full rank - FIXED VERSION."""
         state_dim = 2 * N - 1  # N-1 angles + N frequencies
         n_actual_groups = labels.max().item() + 1
         
@@ -239,21 +239,25 @@ class LyapCoherencyReducer(BaseReducer):
             if len(idx) == 0:
                 continue
             
-            # Angle component
+            # Get inertias for this group
+            M_group = self.sys.M[idx]
+            M_total = M_group.sum()
+            
+            # Angle component - FIX: Use inertia weighting
             if group_has_angle[g]:
                 angle_machines_idx = [i.item() for i in idx if i > 0]
-                # Normalized weight for orthonormality
-                weight_angle = 1.0 / np.sqrt(len(angle_machines_idx))
                 for i in angle_machines_idx:
-                    P[i - 1, col_idx] = weight_angle # Angle state index is i-1
+                    # FIX: Weight by sqrt(M_i / M_group)
+                    weight_angle = torch.sqrt(self.sys.M[i] / M_total).item()
+                    P[i - 1, col_idx] = weight_angle  # Angle state index is i-1
                 col_idx += 1
             
-            # Frequency component
+            # Frequency component - FIX: Use inertia weighting
             if col_idx < latent_dim:
-                # Normalized weight
-                weight_freq = 1.0 / np.sqrt(len(idx))
                 for i in idx:
-                    P[N - 1 + i, col_idx] = weight_freq # Frequency state index is N-1+i
+                    # FIX: Weight by sqrt(M_i / M_group)
+                    weight_freq = torch.sqrt(self.sys.M[i] / M_total).item()
+                    P[N - 1 + i, col_idx] = weight_freq  # Frequency state index is N-1+i
                 col_idx += 1
         
         # Ensure Orthogonality
@@ -312,7 +316,7 @@ class LyapCoherencyReducer(BaseReducer):
         logger.info(f"  Max energy deviation: {max_dev.item():.6e}")
 
     def _build_reduced_dynamics(self):
-        """Build aggregated swing equation dynamics for coherent groups."""
+        """Build aggregated swing equation dynamics for coherent groups - FIXED VERSION."""
         logger.info("  Building reduced-order dynamics...")
         
         device = self.P.device
@@ -325,26 +329,23 @@ class LyapCoherencyReducer(BaseReducer):
         for g in range(self.actual_groups):
             machines_in_group = torch.where(self.labels == g)[0]
             if len(machines_in_group) > 0:
-                # Sum inertias, damping, and mechanical power for the group
+                # Sum inertias, damping for the group
                 M_groups.append(self.sys.M[machines_in_group].sum())
                 D_groups.append(self.sys.D[machines_in_group].sum())
-                P_groups.append(self.sys.P_mechanical[machines_in_group].sum())
+                # FIX: Use negative mechanical power for correct sign convention
+                P_groups.append(-self.sys.P_mechanical[machines_in_group].sum())
         
         self.M_eq = torch.stack(M_groups).to(device)
         self.D_eq = torch.stack(D_groups).to(device)
         self.P_eq = torch.stack(P_groups).to(device)
         
-        # Project coupling matrix to reduced space
-        # Note: This assumes groups are ordered as [angle1, freq1, angle2, freq2, ...]
-        # We need to extract the angle-angle coupling part
+        # FIX: Build weighted coupling matrix K_red
         B_full = self.sys.B_matrix.to(device)
         
-        # Build aggregated coupling matrix
-        n_angle_groups = sum(1 for g in range(self.actual_groups) if any(m > 0 for m in torch.where(self.labels == g)[0]))
-        K_agg = torch.zeros(n_angle_groups, n_angle_groups, device=device)
-        
-        angle_group_idx = 0
+        # Build aggregated coupling matrix with proper weighting
+        # CRITICAL FIX: Count actual angle groups properly
         angle_to_group = {}
+        angle_group_idx = 0
         
         for g in range(self.actual_groups):
             machines = torch.where(self.labels == g)[0]
@@ -352,93 +353,124 @@ class LyapCoherencyReducer(BaseReducer):
                 angle_to_group[g] = angle_group_idx
                 angle_group_idx += 1
         
-        # Sum coupling between groups
+        n_angle_groups = len(angle_to_group)
+        logger.info(f"    Found {n_angle_groups} groups with angle states")
+        
+        K_agg = torch.zeros(n_angle_groups, n_angle_groups, device=device)
+        
+        # FIX: Sum weighted couplings between groups
         for g1 in range(self.actual_groups):
             if g1 not in angle_to_group:
                 continue
             machines1 = torch.where(self.labels == g1)[0]
+            M_g1 = self.sys.M[machines1].sum()
             
             for g2 in range(self.actual_groups):
                 if g2 not in angle_to_group:
                     continue
                 machines2 = torch.where(self.labels == g2)[0]
+                M_g2 = self.sys.M[machines2].sum()
                 
-                # Sum all couplings between machines in the two groups
+                # FIX: Weight coupling by (M_i * M_j) / (M_G * M_H)
                 coupling_sum = 0.0
                 for m1 in machines1:
                     for m2 in machines2:
-                        coupling_sum += B_full[m1, m2].item()
+                        weight = (self.sys.M[m1] * self.sys.M[m2]) / (M_g1 * M_g2)
+                        coupling_sum += B_full[m1, m2].item() * weight.item()
                 
                 K_agg[angle_to_group[g1], angle_to_group[g2]] = coupling_sum
         
         self.K_red = K_agg
+        self.angle_to_group = angle_to_group  # Store for use in f_red
         
         # Define reduced ODE for aggregated swing equations
         def f_red(z, u=None):
-            """Aggregated swing equation dynamics."""
+            """Aggregated swing equation dynamics - FIXED."""
             if z.dim() == 1:
                 z = z.unsqueeze(0)
             
             batch_size = z.shape[0]
             z_dot = torch.zeros_like(z)
             
-            # Extract angles and frequencies from state
-            # Assuming state is ordered as [θ1, ω1, θ2, ω2, ...]
+            # FIX: Extract angles and frequencies correctly
+            # State is ordered as [θ1, ω1, θ2, ω2, ...]
+            theta = z[:, 0::2]  # angles
+            omega = z[:, 1::2]  # frequencies
+            
             n_groups_with_angles = self.K_red.shape[0]
             
-            # Map reduced state indices to angle/frequency pairs
-            state_idx = 0
+            # FIX: Map angle indices correctly
+            # Not all groups have angles, so we need to map carefully
             angle_indices = []
             freq_indices = []
-            group_to_freq_idx = {}
             
+            state_idx = 0
             for g in range(self.actual_groups):
                 if state_idx >= z.shape[1]:
                     break
                     
-                if g in angle_to_group:
+                # Check if this group has angle states
+                if g in self.angle_to_group:
                     angle_indices.append(state_idx)
                     state_idx += 1
                 
+                # All groups have frequency states
                 if state_idx < z.shape[1]:
                     freq_indices.append(state_idx)
-                    group_to_freq_idx[g] = len(freq_indices) - 1
                     state_idx += 1
             
-            if len(angle_indices) > 0:
-                θ = z[:, angle_indices]  # (batch, n_angle_groups)
+            # Angle dynamics: θ_dot = ω
+            for i, angle_idx in enumerate(angle_indices):
+                # Find corresponding frequency index
+                freq_idx = angle_idx + 1  # frequency follows angle in state vector
+                if freq_idx < z.shape[1]:
+                    z_dot[:, angle_idx] = z[:, freq_idx]
+            
+            # Frequency dynamics: ω_dot = (P - D*ω - coupling) / M
+            if n_groups_with_angles > 0 and len(angle_indices) > 0:
+                # Extract angles for groups that have them
+                theta_angle_groups = theta[:, :len(angle_indices)]
                 
                 # Compute coupling terms: K_ij * sin(θ_i - θ_j)
-                θ_i = θ.unsqueeze(2)  # (batch, n_angle, 1)
-                θ_j = θ.unsqueeze(1)  # (batch, 1, n_angle)
+                θ_i = theta_angle_groups.unsqueeze(2)  # (batch, n_angle, 1)
+                θ_j = theta_angle_groups.unsqueeze(1)  # (batch, 1, n_angle)
                 sin_diff = torch.sin(θ_i - θ_j)  # (batch, n_angle, n_angle)
                 
                 K_expanded = self.K_red.unsqueeze(0)  # (1, n_angle, n_angle)
                 coupling_terms = (K_expanded * sin_diff).sum(dim=2)  # (batch, n_angle)
-                
-                # θ_dot = ω (for groups with angles)
-                for i, angle_idx in enumerate(angle_indices):
-                    # Find corresponding frequency
-                    group_idx = [g for g, idx in angle_to_group.items() if idx == i][0]
-                    if group_idx in group_to_freq_idx:
-                        freq_idx = freq_indices[group_to_freq_idx[group_idx]]
-                        z_dot[:, angle_idx] = z[:, freq_idx]
             
-            # ω_dot = (P - D*ω - coupling) / M
-            ω = z[:, freq_indices]  # (batch, n_freq_groups)
-            
-            for i, (g, freq_local_idx) in enumerate(group_to_freq_idx.items()):
-                freq_idx = freq_indices[freq_local_idx]
+            # Update frequency dynamics for all groups
+            for g in range(self.actual_groups):
+                # Find the frequency index for this group
+                freq_idx = None
+                state_idx = 0
+                for g_iter in range(g + 1):
+                    if g_iter in self.angle_to_group and g_iter < g:
+                        state_idx += 1  # Skip angle
+                    if g_iter <= g:
+                        state_idx += 1  # Count frequency
+                freq_idx = state_idx - 1
                 
-                # Mechanical power and damping
-                ω_dot_i = (self.P_eq[g] - self.D_eq[g] * ω[:, freq_local_idx]) / self.M_eq[g]
+                if freq_idx >= z.shape[1]:
+                    continue
+                    
+                # Get the frequency for this group
+                omega_g = z[:, freq_idx]
                 
-                # Add coupling if this group has angle states
-                if g in angle_to_group:
-                    angle_local_idx = angle_to_group[g]
-                    ω_dot_i = ω_dot_i - coupling_terms[:, angle_local_idx] / self.M_eq[g]
+                # Check if this group has angle states and coupling
+                if g in self.angle_to_group and n_groups_with_angles > 0:
+                    # Include coupling term
+                    angle_idx = self.angle_to_group[g]
+                    if angle_idx < coupling_terms.shape[1]:
+                        coupling = coupling_terms[:, angle_idx]
+                        omega_dot = (self.P_eq[g] - self.D_eq[g] * omega_g - coupling) / self.M_eq[g]
+                    else:
+                        omega_dot = (self.P_eq[g] - self.D_eq[g] * omega_g) / self.M_eq[g]
+                else:
+                    # No coupling (no angle state)
+                    omega_dot = (self.P_eq[g] - self.D_eq[g] * omega_g) / self.M_eq[g]
                 
-                z_dot[:, freq_idx] = ω_dot_i
+                z_dot[:, freq_idx] = omega_dot
             
             return z_dot
         
@@ -446,7 +478,7 @@ class LyapCoherencyReducer(BaseReducer):
         
         logger.info(f"    Aggregated {self.sys.n_machines} machines into {self.actual_groups} groups")
         logger.info(f"    Reduced coupling matrix shape: {self.K_red.shape}")
-
+        logger.info(f"    Angle-to-group mapping: {self.angle_to_group}")
     # BaseReducer API
     def fit(self, x):
         """No fitting needed for coherency reducer."""
@@ -490,4 +522,12 @@ class LyapCoherencyReducer(BaseReducer):
             self.labels = self.labels.to(device)
         if hasattr(self, 'deltaV_max'): 
             self.deltaV_max = self.deltaV_max.to(device)
+        if hasattr(self, 'M_eq'):
+            self.M_eq = self.M_eq.to(device)
+        if hasattr(self, 'D_eq'):
+            self.D_eq = self.D_eq.to(device)
+        if hasattr(self, 'P_eq'):
+            self.P_eq = self.P_eq.to(device)
+        if hasattr(self, 'K_red'):
+            self.K_red = self.K_red.to(device)
         return self

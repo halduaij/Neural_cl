@@ -33,28 +33,64 @@ class GPOpInfDynamics(nn.Module):
         self.model_order = "linear"  # Will be updated based on fitting
 
     def forward(self, z, u=None):
+        """Forward pass with comprehensive shape handling."""
+        # Add debug flag
+        debug = getattr(self, '_debug', False)
+        
+        # Ensure z is 2D
         if z.dim() == 1: 
             z = z.unsqueeze(0)
         
-        # Linear dynamics
-        z_dot = z @ self.A.T + self.C
+        batch_size = z.shape[0]
+        
+        if debug:
+            print(f"[Forward] Input z shape: {z.shape}")
+            print(f"[Forward] Input u shape: {u.shape if u is not None else None}")
+        
+        # Validate z dimension
+        if z.shape[1] != self.d:
+            raise ValueError(f"State dimension mismatch: expected {self.d}, got {z.shape[1]}")
+        
+        # Linear dynamics: z @ A.T
+        z_dot = torch.matmul(z, self.A.t())
+        
+        if debug:
+            print(f"[Forward] After A: z_dot shape = {z_dot.shape}")
+        
+        # Add constant term C
+        if self.C.shape == (self.d,):
+            z_dot = z_dot + self.C
+        else:
+            logger.error(f"C has wrong shape: {self.C.shape}, expected ({self.d},)")
+            z_dot = z_dot + self.C.reshape(self.d)
+        
+        if debug:
+            print(f"[Forward] After C: z_dot shape = {z_dot.shape}")
         
         # Control input
-        if self.B is not None:
+        if self.B is not None and self.m > 0:
             if u is None:
-                u = torch.zeros(z.shape[0], self.m, device=z.device)
-            elif u.dim() == 1:
-                u = u.unsqueeze(0)
-            if u.shape[1] == self.m:
-                z_dot += u @ self.B.T
-        
-        # Quadratic dynamics
-        if self.H is not None and self.include_quadratic:
-            z_kron = self._compute_symmetric_kronecker(z)
-            z_dot += z_kron @ self.H.T
+                u = torch.zeros(batch_size, self.m, device=z.device, dtype=z.dtype)
+            else:
+                if u.dim() == 1:
+                    u = u.unsqueeze(0)
+                
+                if u.shape[0] != batch_size:
+                    if u.shape[0] == 1:
+                        u = u.expand(batch_size, -1)
+                    else:
+                        raise ValueError(f"Batch size mismatch: z has batch {batch_size}, u has batch {u.shape[0]}")
+                
+                if u.shape[1] != self.m:
+                    raise ValueError(f"Control dimension mismatch: expected {self.m}, got {u.shape[1]}")
+            
+            control_contribution = torch.matmul(u, self.B.t())
+            z_dot = z_dot + control_contribution
+            
+            if debug:
+                print(f"[Forward] After control: z_dot shape = {z_dot.shape}")
         
         return z_dot
-
     def _compute_symmetric_kronecker(self, z):
         """Compute symmetric Kronecker product [z_i*z_j for i<=j]"""
         batch_size = z.shape[0]
@@ -156,7 +192,10 @@ class GPOpInfDynamics(nn.Module):
             # Account for centering: X_full includes the offset for constant term
             X_T = X_T_centered.clone()
             # The constant term needs adjustment for centering
-            offset_correction = Y_mean.T - (X_T_centered.T @ D_mean.unsqueeze(-1)).squeeze(-1)
+            offset_correction = Y_mean.squeeze(0) - (D_mean @ X_T_centered).squeeze(0)
+            if offset_correction.shape != (self.d,):
+                logger.warning(f"Reshaping offset_correction from {offset_correction.shape} to ({self.d},)")
+                offset_correction = offset_correction.reshape(self.d)
             
             if not torch.isfinite(X_T).all() or not torch.isfinite(offset_correction).all():
                 raise ValueError("NaN/Inf detected in Ridge solution")
@@ -209,29 +248,80 @@ class GPOpInfDynamics(nn.Module):
             logger.warning(f"  Could not verify eigenvalues of learned A")
 
     def _assign_parameters(self, X, offset_correction=None):
-        """Extract parameters from regression solution matrix X"""
+        """Extract parameters from regression solution matrix X with shape validation."""
         col_idx = 0
         
         # Linear term A
-        self.A.data = X[:, col_idx:col_idx + self.d]
+        self.A.data = X[:, col_idx:col_idx + self.d].clone()
         col_idx += self.d
         
         # Control term B
         if self.B is not None:
-            self.B.data = X[:, col_idx:col_idx + self.m]
+            self.B.data = X[:, col_idx:col_idx + self.m].clone()
             col_idx += self.m
         
         # Quadratic term H
         if self.H is not None and self.include_quadratic:
             n_quad = self.d * (self.d + 1) // 2
-            self.H.data = X[:, col_idx:col_idx + n_quad]
+            self.H.data = X[:, col_idx:col_idx + n_quad].clone()
             col_idx += n_quad
         
-        # Constant term C
+        # Constant term C - ensure it's 1D vector of shape (d,)
         if offset_correction is not None:
-            self.C.data = offset_correction.squeeze()
+            # Make absolutely sure it's shape (d,)
+            if isinstance(offset_correction, torch.Tensor):
+                if offset_correction.numel() == self.d:
+                    self.C.data = offset_correction.reshape(self.d).clone()
+                else:
+                    logger.error(f"offset_correction has {offset_correction.numel()} elements, expected {self.d}")
+                    self.C.data = torch.zeros(self.d, device=self.C.device)
+            else:
+                self.C.data = torch.zeros(self.d, device=self.C.device)
         else:
-            self.C.data = X[:, col_idx].squeeze()
+            # Extract from X
+            if col_idx < X.shape[1]:
+                self.C.data = X[:, col_idx].clone()
+            else:
+                logger.warning("No constant term found in regression solution")
+                self.C.data = torch.zeros(self.d, device=self.C.device)
+        
+        # Validate shapes
+        assert self.A.shape == (self.d, self.d), f"A shape mismatch: {self.A.shape}"
+        assert self.C.shape == (self.d,), f"C shape mismatch: {self.C.shape}"
+        if self.B is not None:
+            assert self.B.shape == (self.d, self.m), f"B shape mismatch: {self.B.shape}"
+
+        
+        # Quadratic term H
+        if self.H is not None and self.include_quadratic:
+            n_quad = self.d * (self.d + 1) // 2
+            self.H.data = X[:, col_idx:col_idx + n_quad].clone()
+            col_idx += n_quad
+        
+        # Constant term C - ensure it's 1D vector of shape (d,)
+        if offset_correction is not None:
+            # offset_correction should be shape (d,) or (d, 1)
+            if offset_correction.dim() == 2 and offset_correction.shape[1] == 1:
+                self.C.data = offset_correction.squeeze(1)
+            elif offset_correction.dim() == 1:
+                self.C.data = offset_correction.clone()
+            else:
+                logger.warning(f"Unexpected offset_correction shape: {offset_correction.shape}")
+                self.C.data = torch.zeros(self.d, device=self.C.device)
+        else:
+            # Extract from X
+            if col_idx < X.shape[1]:
+                # X[:, col_idx] should give us shape (d,)
+                self.C.data = X[:, col_idx].clone()
+            else:
+                logger.warning("No constant term found in regression solution")
+                self.C.data = torch.zeros(self.d, device=self.C.device)
+        
+        # Validate shapes
+        assert self.A.shape == (self.d, self.d), f"A shape mismatch: {self.A.shape}"
+        assert self.C.shape == (self.d,), f"C shape mismatch: {self.C.shape}"
+        if self.B is not None:
+            assert self.B.shape == (self.d, self.m), f"B shape mismatch: {self.B.shape}"
 
     def _set_fallback_dynamics(self, device):
         """Set physically reasonable fallback dynamics."""
