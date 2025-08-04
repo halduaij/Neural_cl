@@ -58,7 +58,7 @@ def create_stable_system():
     
     params = dict(M=M, D=D, P=P, K=K)
     
-    sys = SwingEquationSystem(params, dt=0.001)
+    sys = SwingEquationSystem(params, dt=0.01)
     sys.delta_star = delta_star
         
         
@@ -86,7 +86,7 @@ def collect_training_data(sys, params, n_samples=1000):
     
     # Small perturbations
     X = x_eq.unsqueeze(0).repeat(n_samples, 1)
-    X += 0.01 * torch.randn_like(X)
+    X += 0.05 * torch.randn_like(X)
     
     # Compute derivatives
     Xdot = []
@@ -221,7 +221,7 @@ def run_diagnostics(sys, params, spr=None):
     # 5. Compare Linear vs Nonlinear Trajectories
     print("\n5. LINEAR VS NONLINEAR TRAJECTORY COMPARISON:")
     x0 = x_eq + 0.01 * torch.randn_like(x_eq)
-    dt = 0.001
+    dt = 0.01
     n_steps = 100
     
     # Nonlinear trajectory
@@ -772,12 +772,10 @@ mpl.rcParams.update({
     "axes.grid": True,
     "grid.alpha": 0.3,
 })
-
 def plot_comparison(sys, reducers, x0, T_horizon, dt):
     """Plot full vs ROM trajectories with clearer styling."""
     fig, axs = plt.subplots(3, 2, figsize=(13, 9), constrained_layout=True)
-    t = np.arange(int(T_horizon/dt)+1) * dt
-
+    
     # --- helper -------------------------------------------------------
     def rom_colour(idx):           # pick next colour for successive ROMs
         base = mpl.cm.tab10.colors[idx % 10]
@@ -786,6 +784,10 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
     # --- simulate full system once -----------------------------------
     traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
     E_full = sys.energy_function(traj_full).cpu().numpy()
+    
+    # Create time array that matches trajectory length
+    n_points = traj_full.shape[0]
+    t = np.arange(n_points) * dt
 
     # plot helpers
     labels_shown = {"angles": False, "freqs": False}
@@ -795,8 +797,8 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
 
     # --- angles & freqs ----------------------------------------------
     for i in range(3):
-        add_trace(axs[0,0], traj_full[:, i].cpu(), rf"$\theta_{i+2}$ (full)", "-", rom_colour(i))
-        add_trace(axs[0,1], traj_full[:, 9+i].cpu(),  rf"$\omega_{i+1}$ (full)", "-", rom_colour(i))
+        add_trace(axs[0,0], traj_full[:, i].cpu(), rf"$\theta_{{1,{i+2}}}$ (full)", "-", rom_colour(i))
+        add_trace(axs[0,1], traj_full[:, 9+i].cpu(), rf"$\omega_{{{i+1}}}$ (full)", "-", rom_colour(i))
 
     # --- energy & errors containers ----------------------------------
     axs[1,0].plot(t, E_full, "-", color="black", label="Full system")
@@ -804,25 +806,26 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
     axs[1,0].set_ylabel("Joules")
 
     axs[1,1].set_yscale("log")
-    axs[1,1].set_title("|Energy error|  &  ||x – x_ROM||")
-    axs[1,1].set_xlabel("Time [s]")
+    axs[1,1].set_title("|Energy error|  &  ||x – x_ROM||")
+    axs[1,1].set_xlabel("Time [s]")
 
     # --- each ROM -----------------------------------------------------
     for k, (name, red) in enumerate(reducers.items(), start=1):
         if red is None:
             continue
+        # Use n_points-1 steps to get n_points total (including initial condition)
         traj_rom = rollout_rom(red, sys, x0.unsqueeze(0),
-                               int(T_horizon/dt), dt=dt,method="rk4")[0]
+                               n_points-1, dt=dt, method="rk4")[0]
         E_rom = sys.energy_function(traj_rom).cpu().numpy()
 
         c = rom_colour(k)
         # angles / freqs dashed
         for i in range(3):
             add_trace(axs[0,0], traj_rom[:, i].cpu(),
-                      f"{name} θ_{i+2}" if not labels_shown["angles"] else None,
+                      f"{name} θ_{{1,{i+2}}}" if not labels_shown["angles"] else None,
                       "--", c)
             add_trace(axs[0,1], traj_rom[:, 9+i].cpu(),
-                      f"{name} ω_{i+1}" if not labels_shown["freqs"] else None,
+                      f"{name} ω_{{{i+1}}}" if not labels_shown["freqs"] else None,
                       "--", c)
         labels_shown["angles"] = labels_shown["freqs"] = True
 
@@ -838,10 +841,10 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
     # --- cosmetics ----------------------------------------------------
     for ax in axs.flat:
         ax.set_xlim(0, T_horizon)
-    axs[0,0].set_title("Rotor angles (first 3)")
-    axs[0,1].set_title("Rotor frequencies (first 3)")
+    axs[0,0].set_title("Relative angles θ_{1,j} (first 3)")
+    axs[0,1].set_title("Rotor frequencies ω_i (first 3)")
     axs[0,0].set_ylabel("rad")
-    axs[0,1].set_ylabel("rad s⁻¹")
+    axs[0,1].set_ylabel("rad s⁻¹")
     axs[2,0].remove()                       # free one cell for a big legend
     handles, labels = [], []
     for ax in axs.flat:
@@ -850,7 +853,7 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
     axs[2,1].legend(handles, labels, ncol=3, fontsize=8,
                     loc="center", frameon=False)
     axs[2,1].axis("off")
-    fig.suptitle("Full vs reduced‑order swing dynamics (IEEE‑39, Δ0≈5 %)",
+    fig.suptitle("Full vs reduced‑order swing dynamics (IEEE‑39, Δ0≈5 %)",
                  fontsize=14, fontweight="bold")
     return fig
 

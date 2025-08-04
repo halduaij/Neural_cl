@@ -107,7 +107,7 @@ class SwingEquationSystem(ControlAffineSystem):
         controller_period = kwargs.pop('controller_period', None)
         guard = kwargs.pop('guard', None)
         params = kwargs.pop('params', None)
-        
+        method = kwargs.pop('method', None)
         # FIX: Extract 'controller' from kwargs explicitly
         controller_kw = kwargs.pop('controller', None)
         
