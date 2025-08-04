@@ -590,62 +590,80 @@ class SwingEquationSystem(ControlAffineSystem):
         diff = delta.unsqueeze(2) - delta.unsqueeze(1)
         U_pair = 0.5 * self.B_matrix.to(delta.device) * (1 - torch.cos(diff))
         return U_pair.sum(2)
-
-    def energy_function(self, x: torch.Tensor) -> torch.Tensor:
+ 
+    # -------------------------------------------------------------------------
+    #  NEW unified energy routine – drop‑in replacement
+    # -------------------------------------------------------------------------
+    def energy_function(
+        self,
+        x: torch.Tensor,
+        *,
+        relative: bool = True,
+    ) -> torch.Tensor:
         """
-        Correct energy function avoiding double counting of coupling terms.
-        For symmetric B matrix: V = sum_{i<j} B_ij * (1 - cos(delta_i - delta_j))
+        Hamiltonian (kinetic + potential) of the n‑machine swing system.
+
+        Parameters
+        ----------
+        x : (B, n_dims) or (n_dims,) tensor
+            State in *relative‑angle* coordinates
+            ``x = [θ_12 … θ_1n, ω_1 … ω_n]``.
+        relative : bool, default **True**
+            • ``True``  – return the **Lyapunov candidate**
+
+                  V_rel = T + (V – V_eq)
+
+              so V_rel(x_eq)=0.
+
+            • ``False`` – return the **absolute Hamiltonian**
+
+                  H = T + V
+
+              so H(x_eq)=T_eq+V_eq = V_eq.
+
+        Notes
+        -----
+        *The only difference from the old code is the extra keyword and the
+        caching of V_eq; the numerical expressions are unchanged.*
         """
-        B_size = x.shape[0]
-        N = self.N_NODES
+        # ---- tensor hygiene --------------------------------------------------
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        Bsz, N_tot = x.shape
+        assert N_tot == self.N_DIMS, f"expected {self.N_DIMS}-vector, got {N_tot}"
+        device, dtype = x.device, x.dtype
+        n = self.N_NODES
 
-        # Extract states
-        theta = x[:, :N-1]  # theta[i-1] = theta_1i = delta_1 - delta_i
-        omega = x[:, N-1:]
+        θ_rel = x[:, : n - 1]                 # (B, n‑1)
+        ω      = x[:, n - 1:]                 # (B, n)
 
-        # Kinetic energy
-        M_device = self.M.to(x.device)
-        if M_device.dim() == 1:
-            M_device = M_device.unsqueeze(0)
-        T = 0.5 * (M_device * omega ** 2).sum(1)
+        # ---- kinetic energy --------------------------------------------------
+        T = 0.5 * (self.M.to(device, dtype) * ω**2).sum(dim=1)   # (B,)
 
-        # Potential energy - count each pair only once!
-        B = self.B_matrix.to(x.device)
-        V = torch.zeros(B_size, device=x.device)
-        
-        # For all pairs (i,j) with i < j:
-        # delta_i - delta_j = ?
-        # delta_0 = 0 (reference)
-        # delta_i = -theta[i-1] for i > 0
-        
-        # Pairs involving machine 0
-        for j in range(1, N):
-            # delta_0 - delta_j = 0 - (-theta[j-1]) = theta[j-1]
-            V = V + B[0, j] * (1 - torch.cos(theta[:, j-1]))
-        
-        # Pairs not involving machine 0  
-        for i in range(1, N):
-            for j in range(i+1, N):
-                # delta_i - delta_j = -theta[i-1] - (-theta[j-1]) = theta[j-1] - theta[i-1]
-                V = V + B[i, j] * (1 - torch.cos(theta[:, j-1] - theta[:, i-1]))
-        
-        # Compute equilibrium energy
-        x_eq = self.goal_point.squeeze()
-        theta_eq = x_eq[:N-1]
-        
-        V_eq = 0.0
-        # Same structure for equilibrium
-        for j in range(1, N):
-            V_eq = V_eq + B[0, j] * (1 - torch.cos(theta_eq[j-1]))
-        
-        for i in range(1, N):
-            for j in range(i+1, N):
-                V_eq = V_eq + B[i, j] * (1 - torch.cos(theta_eq[j-1] - theta_eq[i-1]))
-        
-        # Total relative energy
-        E = T + (V - V_eq)
-        
-        return E
+        # ---- potential energy (count each i<j once) --------------------------
+        δ = torch.zeros(Bsz, n, device=device, dtype=dtype)      # δ_1 = 0
+        δ[:, 1:] = -θ_rel                                        # δ_i = −θ_1i
+
+        Δ = δ.unsqueeze(2) - δ.unsqueeze(1)                      # (B,n,n)
+
+        mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=device), 1)
+        V = ( self.B_matrix.to(device, dtype)[mask] *
+              (1.0 - torch.cos(Δ[:, mask])) ).sum(dim=1)         # (B,)
+
+        # ---- subtract equilibrium offset if asked for -----------------------
+        if relative:
+            if not hasattr(self, "_V_eq_cache"):
+                θ_eq = self.goal_point.squeeze()[: n - 1]        # (n‑1,)
+                δ_eq = torch.zeros(n, device=device, dtype=dtype)
+                δ_eq[1:] = -θ_eq
+                Δ_eq = δ_eq.unsqueeze(1) - δ_eq.unsqueeze(0)
+                V_eq = ( self.B_matrix.to(device, dtype)[mask] *
+                         (1.0 - torch.cos(Δ_eq[mask])) ).sum()
+                self._V_eq_cache = V_eq.detach()
+            V = V - self._V_eq_cache.to(device)
+
+        return T + V
+
 
     @torch.no_grad()
     def collect_random_trajectories(

@@ -5,6 +5,7 @@ Full Dimension Test with Actual Trajectory Simulation
 Tests all reducers with d=19 (full dimension) by simulating actual trajectories
 over time and comparing full vs reduced model behavior.
 """
+import sys
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -335,7 +336,7 @@ def test_energy_consistency(sys, params):
     E_manual = T_manual + V_manual
     
     # Compare with system's energy function
-    E_sys = sys.energy_function(x_test.unsqueeze(0)).squeeze()
+    E_sys = sys.energy_function(x_test.unsqueeze(0), relative=False).squeeze()
     
     print(f"   Manual calculation: E = {E_manual.item():.6f}")
     print(f"   System energy func: E = {E_sys.item():.6f}")
@@ -346,7 +347,7 @@ def test_energy_consistency(sys, params):
         
     # Test 3: Check if energy at equilibrium is handled correctly
     print("\n3. ENERGY AT EQUILIBRIUM:")
-    E_eq = sys.energy_function(x_eq.unsqueeze(0)).squeeze()
+    E_eq = sys.energy_function(x_eq.unsqueeze(0), relative=False).squeeze()
     print(f"   E(x_eq) = {E_eq.item():.6f}")
     
     # The energy function might be defined relative to equilibrium
@@ -439,7 +440,7 @@ def test_trajectory_preservation():
     try:
         A, J, R = sys.linearise(return_JR=True)
         # Try with enhanced=False to see if it preserves symplectic structure better
-        spr = SymplecticProjectionReducer(A, J, R, 18, enhanced=False)
+        spr = SymplecticProjectionReducer(A, J, R, 18, enhanced=True)
         spr.full_dim = 19
         
         # Simulate trajectories
@@ -738,7 +739,7 @@ def verify_energy_function(sys, params):
     x_test.requires_grad_(True)
     
     # 1. CHECK ENERGY GRADIENT MATCHES DYNAMICS STRUCTURE
-    E = sys.energy_function(x_test.unsqueeze(0)).squeeze()
+    E = sys.energy_function(x_test.unsqueeze(0), relative=False).squeeze()
     grad_E = torch.autograd.grad(E, x_test, create_graph=True)[0]
     
     # Split gradient
