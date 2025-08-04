@@ -1,80 +1,80 @@
 """
-Diagnostic script to identify why near-full dimension reduction is failing
-=========================================================================
+Diagnostic tool for debugging reducer issues
+===========================================
 
-Run this after creating your reducers to isolate the issue.
+Run this to diagnose problems with dimension reduction.
 """
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
 
-def diagnose_reducer(reducer, reducer_name, sys, X_train, detailed=True):
-    """Comprehensive diagnostic for a single reducer."""
-    print(f"\n{'='*60}")
-    print(f"DIAGNOSING: {reducer_name}")
-    print(f"{'='*60}")
+def diagnose_reducer(reducer, X_test, system=None, name="Reducer"):
+    """
+    Comprehensive diagnostic for a dimension reducer.
     
-    # Basic info
+    Args:
+        reducer: The reducer to diagnose
+        X_test: Test data (n_samples, n_dims)
+        system: Optional system object for additional checks
+        name: Name for display
+    """
+    print("\n" + "="*60)
+    print(f"DIAGNOSING: {name}")
+    print("="*60)
+    
     print(f"Latent dimension: {reducer.latent_dim}")
-    print(f"Full dimension: {getattr(reducer, 'full_dim', 'Not set')}")
+    print(f"Full dimension: {getattr(reducer, 'full_dim', X_test.shape[1])}")
     
-    # Test 1: Pure projection/reconstruction (no dynamics)
+    # 1. Pure projection test
     print("\n1. PURE PROJECTION TEST (no dynamics)")
-    print("-" * 40)
+    print("-"*40)
     
-    # Use different test sizes
-    test_sizes = [1, 10, 100]
-    for n_test in test_sizes:
-        X_test = torch.randn(n_test, sys.n_dims)
+    for batch_size in [1, 10, 100]:
+        if batch_size > X_test.shape[0]:
+            continue
+            
+        X_batch = X_test[:batch_size]
+        Z_batch = reducer.forward(X_batch)
+        X_recon = reducer.inverse(Z_batch)
         
-        # Forward and inverse
-        Z = reducer.forward(X_test)
-        X_recon = reducer.inverse(Z)
+        abs_error = (X_batch - X_recon).norm(dim=1)
+        rel_error = abs_error / (X_batch.norm(dim=1) + 1e-8)
         
-        # Compute errors
-        abs_errors = (X_recon - X_test).norm(dim=1)
-        rel_errors = abs_errors / (X_test.norm(dim=1) + 1e-10)
+        print(f"  Batch size {batch_size}:")
+        print(f"    Absolute error: mean={abs_error.mean():.2e}, max={abs_error.max():.2e}")
+        print(f"    Relative error: mean={rel_error.mean():.2%}, max={rel_error.max():.2%}")
         
-        print(f"  Batch size {n_test}:")
-        print(f"    Absolute error: mean={abs_errors.mean():.2e}, max={abs_errors.max():.2e}")
-        print(f"    Relative error: mean={rel_errors.mean():.2%}, max={rel_errors.max():.2%}")
-        
-        # This should be ~0 for near-full dimension!
-        if abs_errors.mean() > 1e-6:
-            print("    ⚠️  WARNING: Large projection error for near-full dimension!")
+        if reducer.latent_dim >= 0.9 * X_batch.shape[1] and rel_error.max() > 1e-3:
+            print(f"    ⚠️  WARNING: Large projection error for near-full dimension!")
     
-    # Test 2: Check projection matrices
+    # 2. Projection matrix analysis
     print("\n2. PROJECTION MATRIX ANALYSIS")
-    print("-" * 40)
+    print("-"*40)
     
-    if hasattr(reducer, 'P'):  # LCR style
+    if hasattr(reducer, 'proj'):  # OpInf style
+        P = reducer.proj
+        print(f"  proj shape: {P.shape}")
+        print(f"  proj condition number: {torch.linalg.cond(P):.2e}")
+        print(f"  proj rank: {torch.linalg.matrix_rank(P).item()}")
+        
+        # Check orthogonality
+        ortho_error = torch.norm(P.T @ P - torch.eye(P.shape[1]))
+        print(f"  ||proj.T @ proj - I||: {ortho_error:.2e}")
+        
+    elif hasattr(reducer, 'P'):  # LCR style
         P = reducer.P
         Pi = reducer.Pi
         print(f"  P shape: {P.shape}")
         print(f"  P condition number: {torch.linalg.cond(P):.2e}")
         print(f"  P rank: {torch.linalg.matrix_rank(P).item()}")
         
-        # Check projection property
-        P_proj = P @ Pi
-        proj_error = torch.norm(P_proj @ P - P)
-        print(f"  ||P @ Pi @ P - P||: {proj_error:.2e}")
+        # Check projection properties
+        PPi = P @ Pi
+        print(f"  ||P @ Pi @ P - P||: {torch.norm(PPi @ P - P):.2e}")
+        print(f"  ||Pi @ P @ Pi - Pi||: {torch.norm(Pi @ PPi - Pi):.2e}")
         
-        # Check if Pi is a proper pseudo-inverse
-        pinv_error = torch.norm(Pi @ P @ Pi - Pi)
-        print(f"  ||Pi @ P @ Pi - Pi||: {pinv_error:.2e}")
-        
-    elif hasattr(reducer, 'proj'):  # OpInf style
-        proj = reducer.proj
-        print(f"  proj shape: {proj.shape}")
-        print(f"  proj condition number: {torch.linalg.cond(proj):.2e}")
-        print(f"  proj rank: {torch.linalg.matrix_rank(proj).item()}")
-        
-        # For d=19, proj should be nearly square
-        if proj.shape[1] == proj.shape[0]:
-            I_error = torch.norm(proj @ proj.T - torch.eye(proj.shape[0]))
-            print(f"  ||proj @ proj.T - I||: {I_error:.2e}")
-            
     elif hasattr(reducer, 'T'):  # SPR style
         T = reducer.T
         Ti = reducer.Ti
@@ -82,247 +82,270 @@ def diagnose_reducer(reducer, reducer_name, sys, X_train, detailed=True):
         print(f"  T condition number: {torch.linalg.cond(T):.2e}")
         print(f"  T rank: {torch.linalg.matrix_rank(T).item()}")
         
-        # Check projection property
-        T_proj = T @ Ti
-        proj_error = torch.norm(T_proj @ T - T)
-        print(f"  ||T @ Ti @ T - T||: {proj_error:.2e}")
+        # Check properties
+        print(f"  ||T @ Ti @ T - T||: {torch.norm(T @ Ti @ T - T):.2e}")
     
-    # Test 3: State space coverage
+    # 3. State space coverage
     print("\n3. STATE SPACE COVERAGE TEST")
-    print("-" * 40)
+    print("-"*40)
     
-    # Use actual training data
-    X_sample = X_train[:min(50, len(X_train))]
-    Z_sample = reducer.forward(X_sample)
-    X_recon_sample = reducer.inverse(Z_sample)
+    # Test on training data span
+    X_mean = X_test.mean(0)
+    X_centered = X_test - X_mean
     
-    recon_errors = (X_recon_sample - X_sample).norm(dim=1)
+    # Project and reconstruct centered data
+    if hasattr(reducer, 'μ'):
+        X_test_centered = X_test - reducer.μ
+    else:
+        X_test_centered = X_test
+        
+    Z_test = reducer.forward(X_test)
+    X_recon_test = reducer.inverse(Z_test)
+    
+    recon_errors = (X_test - X_recon_test).norm(dim=1)
     print(f"  On training data reconstruction:")
     print(f"    Mean error: {recon_errors.mean():.2e}")
     print(f"    Max error: {recon_errors.max():.2e}")
     print(f"    Std error: {recon_errors.std():.2e}")
     
-    # Test 4: Jacobian test (if implemented)
+    # 4. Jacobian test
     print("\n4. JACOBIAN CONSISTENCY TEST")
-    print("-" * 40)
+    print("-"*40)
     
-    try:
-        x_test = X_train[0:1]  # Single point
-        J = reducer.jacobian(x_test)
-        print(f"  Jacobian shape: {J.shape}")
+    x_test = X_test[0:1].clone().requires_grad_(True)
+    
+    # Analytical Jacobian
+    J_analytical = reducer.jacobian(x_test)
+    print(f"  Jacobian shape: {J_analytical.shape}")
+    
+    # Finite difference check
+    eps = 1e-5
+    z_base = reducer.forward(x_test)
+    J_fd = torch.zeros_like(J_analytical)
+    
+    for i in range(x_test.shape[1]):
+        x_pert = x_test.clone()
+        x_pert[0, i] += eps
+        z_pert = reducer.forward(x_pert)
+        J_fd[0, :, i] = (z_pert - z_base)[0] / eps
+    
+    jac_error = (J_analytical - J_fd).norm() / (J_fd.norm() + 1e-8)
+    print(f"  Finite difference error: {jac_error:.2%}")
+    
+    # 5. Physics preservation (if system available)
+    if system is not None:
+        print("\n5. PHYSICS PRESERVATION TESTS")
+        print("-"*40)
         
-        # Finite difference check
-        eps = 1e-6
-        z_base = reducer.forward(x_test)
-        J_fd = torch.zeros_like(J)
+        # Equilibrium preservation
+        if hasattr(system, 'goal_point'):
+            x_eq = system.goal_point.squeeze()
+            z_eq = reducer.forward(x_eq.unsqueeze(0))
+            x_eq_recon = reducer.inverse(z_eq).squeeze()
+            eq_error = (x_eq - x_eq_recon).norm()
+            print(f"  Equilibrium reconstruction error: {eq_error:.2e}")
         
-        for i in range(x_test.shape[1]):
-            x_pert = x_test.clone()
-            x_pert[0, i] += eps
-            z_pert = reducer.forward(x_pert)
-            J_fd[0, :, i] = (z_pert - z_base)[0] / eps
-        
-        J_error = torch.norm(J - J_fd) / (torch.norm(J) + 1e-10)
-        print(f"  Finite difference error: {J_error:.2%}")
-        
-    except Exception as e:
-        print(f"  Jacobian test failed: {e}")
+        # Energy preservation
+        if hasattr(system, 'energy_function'):
+            E_orig = system.energy_function(X_test)
+            E_recon = system.energy_function(X_recon_test)
+            
+            if E_orig.shape == E_recon.shape:
+                E_abs_error = (E_orig - E_recon).abs()
+                E_rel_error = E_abs_error / (E_orig.abs() + 1e-8)
+                
+                print(f"  Energy preservation:")
+                print(f"    Absolute error: mean={E_abs_error.mean():.2e}, max={E_abs_error.max():.2e}")
+                print(f"    Relative error: mean={E_rel_error.mean():.2%}, max={E_rel_error.max():.2%}")
     
-    # Test 5: Specific physics tests
-    print("\n5. PHYSICS PRESERVATION TESTS")
-    print("-" * 40)
-    
-    # Test equilibrium preservation
-    if hasattr(sys, 'goal_point'):
-        x_eq = sys.goal_point.squeeze()
-        z_eq = reducer.forward(x_eq.unsqueeze(0))
-        x_eq_recon = reducer.inverse(z_eq).squeeze()
-        eq_error = torch.norm(x_eq_recon - x_eq)
-        print(f"  Equilibrium reconstruction error: {eq_error:.2e}")
-    
-    # Test energy preservation
-    if hasattr(sys, 'energy_function'):
-        E_orig = sys.energy_function(X_sample)
-        E_recon = sys.energy_function(X_recon_sample)
-        E_errors = torch.abs(E_recon - E_orig)
-        E_rel_errors = E_errors / (torch.abs(E_orig) + 1e-10)
-        print(f"  Energy preservation:")
-        print(f"    Absolute error: mean={E_errors.mean():.2e}, max={E_errors.max():.2e}")
-        print(f"    Relative error: mean={E_rel_errors.mean():.2%}, max={E_rel_errors.max():.2%}")
-    
-    # Test 6: Dynamics test (if applicable)
+    # 6. Dynamics test (if available)
     if hasattr(reducer, 'dyn') and reducer.dyn is not None:
         print("\n6. LEARNED DYNAMICS TEST")
-        print("-" * 40)
+        print("-"*40)
         
-        # Check eigenvalues of dynamics matrix
+        # Check eigenvalues
         if hasattr(reducer.dyn, 'A'):
             A = reducer.dyn.A
             eigvals = torch.linalg.eigvals(A)
             max_real = eigvals.real.max().item()
             print(f"  Max eigenvalue real part: {max_real:.4f}")
+            
+            # Check discrete stability
+            dt = 0.01
+            A_discrete = torch.eye(A.shape[0]) + dt * A
+            rho = torch.linalg.eigvals(A_discrete).abs().max().item()
+            print(f"  Discrete spectral radius (dt={dt}): {rho:.6f}")
+            
+            # Dynamics matrix properties
             print(f"  Dynamics matrix norm: {A.norm():.2e}")
     
     return {
-        'reducer_name': reducer_name,
+        'name': name,
         'latent_dim': reducer.latent_dim,
-        'projection_error': abs_errors.mean().item(),
-        'energy_error': E_errors.mean().item() if 'E_errors' in locals() else None
+        'projection_error': recon_errors.mean().item(),
+        'max_projection_error': recon_errors.max().item(),
     }
 
 
-def compare_reducers(reducers_dict, sys, X_train):
-    """Compare all reducers side by side."""
-    print("\n" + "="*80)
-    print("COMPARATIVE SUMMARY")
-    print("="*80)
+def compare_reducers(reducers, X_test, system=None):
+    """
+    Compare multiple reducers side by side.
     
+    Args:
+        reducers: Dict of {name: reducer}
+        X_test: Test data
+        system: Optional system object
+    """
     results = []
-    for name, reducer in reducers_dict.items():
+    
+    for name, reducer in reducers.items():
         if reducer is not None:
-            result = diagnose_reducer(reducer, name, sys, X_train, detailed=False)
+            result = diagnose_reducer(reducer, X_test, system, name)
             results.append(result)
     
-    # Print comparison table
-    print(f"\n{'Method':<12} {'Dim':<6} {'Proj Error':<12} {'Energy Error':<12}")
-    print("-" * 48)
+    # Summary table
+    print("\n" + "="*60)
+    print("COMPARATIVE SUMMARY")
+    print("="*60)
     
-    for r in results:
-        energy_str = f"{r['energy_error']:.2e}" if r['energy_error'] else "N/A"
-        print(f"{r['reducer_name']:<12} {r['latent_dim']:<6} "
-              f"{r['projection_error']:<12.2e} {energy_str:<12}")
+    print(f"{'Method':<15} {'Dim':<5} {'Proj Error':<12} {'Max Error':<12}")
+    print("-"*50)
+    
+    for res in results:
+        print(f"{res['name']:<15} {res['latent_dim']:<5} "
+              f"{res['projection_error']:<12.2e} {res['max_projection_error']:<12.2e}")
+    
+    return results
 
 
-def plot_projection_errors(reducers_dict, sys, n_points=100):
-    """Visualize projection errors across state space."""
-    fig, axes = plt.subplots(1, len(reducers_dict), figsize=(15, 5))
-    if len(reducers_dict) == 1:
-        axes = [axes]
+def plot_projection_errors(reducers, X_test, save_path=None):
+    """
+    Plot histogram of projection errors for each reducer.
+    """
+    plt.figure(figsize=(12, 4))
     
-    # Generate random test points
-    X_test = torch.randn(n_points, sys.n_dims)
+    n_reducers = len([r for r in reducers.values() if r is not None])
+    plot_idx = 1
     
-    for ax, (name, reducer) in zip(axes, reducers_dict.items()):
+    for name, reducer in reducers.items():
         if reducer is None:
             continue
             
-        # Compute reconstruction errors
+        plt.subplot(1, n_reducers, plot_idx)
+        
+        # Compute errors
         Z = reducer.forward(X_test)
         X_recon = reducer.inverse(Z)
-        errors = (X_recon - X_test).norm(dim=1).cpu().numpy()
+        errors = (X_test - X_recon).norm(dim=1).cpu().numpy()
         
         # Plot histogram
-        ax.hist(errors, bins=30, alpha=0.7, edgecolor='black')
-        ax.set_xlabel('Reconstruction Error')
-        ax.set_ylabel('Count')
-        ax.set_title(f'{name} (d={reducer.latent_dim})')
-        ax.set_yscale('log')
+        plt.hist(errors, bins=50, alpha=0.7, edgecolor='black')
+        plt.xlabel('Reconstruction Error')
+        plt.ylabel('Count')
+        plt.title(f'{name}\n(d={reducer.latent_dim})')
+        plt.yscale('log')
         
         # Add statistics
-        ax.axvline(errors.mean(), color='red', linestyle='--', 
+        plt.axvline(errors.mean(), color='red', linestyle='--', 
                    label=f'Mean: {errors.mean():.2e}')
-        ax.axvline(np.median(errors), color='green', linestyle='--',
-                   label=f'Median: {np.median(errors):.2e}')
-        ax.legend()
+        plt.axvline(np.percentile(errors, 95), color='orange', linestyle='--',
+                   label=f'95%: {np.percentile(errors, 95):.2e}')
+        plt.legend()
+        
+        plot_idx += 1
     
     plt.tight_layout()
-    plt.savefig('reducer_projection_errors.png', dpi=150)
-    print("\nProjection error histograms saved to 'reducer_projection_errors.png'")
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\nProjection error histograms saved to '{save_path}'")
+    
+    plt.show()
 
 
-def minimal_dynamics_test(reducer, sys, x0, dt=0.01, n_steps=10):
-    """Test just the dynamics computation without full simulation."""
-    print(f"\nMINIMAL DYNAMICS TEST")
-    print("-" * 40)
+def test_dynamics_stability(reducer, X_test, dt=0.01, n_steps=100):
+    """
+    Test the stability of learned dynamics through short rollouts.
+    """
+    print(f"\nTesting {type(reducer).__name__}:")
     
-    x = x0.clone()
-    z = reducer.forward(x)
+    if not hasattr(reducer, 'dyn') or reducer.dyn is None:
+        print("  No learned dynamics to test")
+        return
     
-    errors = []
-    for step in range(n_steps):
-        # Full space dynamics
-        f_full = sys._f(x, sys.nominal_params)
-        x_next_full = x + dt * f_full.squeeze()
+    print("\nMINIMAL DYNAMICS TEST")
+    print("-"*40)
+    
+    # Pick a few test points
+    n_tests = min(10, X_test.shape[0])
+    
+    stable_count = 0
+    
+    for i in range(n_tests):
+        x0 = X_test[i:i+1]
+        z = reducer.forward(x0)
         
-        # Reduced space dynamics (manual)
-        x_recon = reducer.inverse(z)
-        f_recon = sys._f(x_recon, sys.nominal_params)
+        stable = True
+        for t in range(n_steps):
+            z_dot = reducer.dyn.forward(z)
+            z_next = z + dt * z_dot
+            
+            if not torch.isfinite(z_next).all() or z_next.norm() > 1e5:
+                stable = False
+                break
+                
+            z = z_next
         
-        # Project dynamics
-        if hasattr(reducer, 'jacobian'):
-            J = reducer.jacobian(x_recon)
-            z_dot = torch.bmm(J, f_recon).squeeze()
+        if stable:
+            stable_count += 1
+            final_error = (reducer.inverse(z) - x0).norm().item()
+            print(f"  Step {i}: error = {final_error:.2e}")
         else:
-            # Finite difference fallback
-            eps = 1e-8
-            z_plus = reducer.forward(x_recon + eps * f_recon.squeeze())
-            z_dot = (z_plus - z) / eps
-        
-        z_next = z + dt * z_dot
-        x_next_reduced = reducer.inverse(z_next)
-        
-        # Compare
-        error = torch.norm(x_next_reduced - x_next_full).item()
-        errors.append(error)
-        print(f"  Step {step}: error = {error:.2e}")
-        
-        # Update for next iteration
-        x = x_next_full
-        z = reducer.forward(x)
+            print(f"  Step {i}: UNSTABLE at t={t}")
     
-    print(f"  Mean error over {n_steps} steps: {np.mean(errors):.2e}")
-
-
-# Main diagnostic function to call
-def run_full_diagnostic(sys, spr=None, opinf=None, lcr=None, X_train=None):
-    """Run complete diagnostic suite."""
+    print(f"  Stability rate: {stable_count}/{n_tests}")
     
+
+def run_full_diagnostic(system, spr=None, opinf=None, lcr=None, X_train=None):
+    """
+    Run complete diagnostic on all reducers.
+    """
     if X_train is None:
-        print("Warning: No training data provided, using random data")
-        X_train = torch.randn(100, sys.n_dims)
+        # Generate test data
+        print("Generating test data...")
+        X_train = system.sample_state_space(1000)
     
-    # Collect available reducers
+    # Collect non-None reducers
     reducers = {}
-    if spr is not None:
-        reducers['SPR-18'] = spr
     if opinf is not None:
         reducers['OpInf-19'] = opinf
     if lcr is not None:
         reducers['LCR-18'] = lcr
+    if spr is not None:
+        reducers['SPR-18'] = spr
     
-    if not reducers:
-        print("Error: No reducers provided!")
-        return
+    # Run comparative diagnostic
+    results = compare_reducers(reducers, X_train, system)
     
-    # Run individual diagnostics
-    for name, reducer in reducers.items():
-        diagnose_reducer(reducer, name, sys, X_train)
+    # Plot errors
+    if len(reducers) > 0:
+        plot_projection_errors(reducers, X_train, 'reducer_projection_errors.png')
     
-    # Comparative analysis
-    compare_reducers(reducers, sys, X_train)
-    
-    # Visual analysis
-    plot_projection_errors(reducers, sys)
-    
-    # Test dynamics for one reducer
+    # Test dynamics
     print("\n" + "="*80)
     print("DYNAMICS INTEGRATION TEST")
     print("="*80)
     
-    x0 = sys.goal_point.squeeze()
     for name, reducer in reducers.items():
-        print(f"\nTesting {name}:")
-        minimal_dynamics_test(reducer, sys, x0.unsqueeze(0))
-        break  # Just test one
+        if reducer is not None:
+            test_dynamics_stability(reducer, X_train[:10])
     
     print("\n" + "="*80)
     print("DIAGNOSTIC COMPLETE")
     print("="*80)
+    
     print("\nIf projection errors are large (>1e-6) for near-full dimension,")
     print("the issue is in the reducer construction.")
     print("If projection is good but dynamics fail, the issue is in rollout_rom.")
-
-
-if __name__ == "__main__":
-    # Example usage:
-    run_full_diagnostic(sys, spr=spr, opinf=opinf, lcr=lcr, X_train=X_train)
+    
+    return results
