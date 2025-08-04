@@ -149,6 +149,8 @@ class OpInfReducer(BaseReducer):
         if self.sys is not None:
             actual_n_controls = getattr(self.sys, 'n_controls', self.n_controls)
         
+        actual_n_controls = getattr(self.sys, 'n_controls', self.n_controls) if self.sys else self.n_controls
+
         self.dyn = GPOpInfDynamics(
             self.latent_dim, 
             actual_n_controls,  # FIXED: Use actual control dimension

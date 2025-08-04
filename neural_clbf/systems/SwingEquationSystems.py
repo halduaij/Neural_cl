@@ -593,50 +593,59 @@ class SwingEquationSystem(ControlAffineSystem):
 
     def energy_function(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Total energy (Lyapunov function) relative to the equilibrium point (V(x_eq) = 0).
-        FIX: Implemented the standard structure-preserving energy function.
+        Correct energy function avoiding double counting of coupling terms.
+        For symmetric B matrix: V = sum_{i<j} B_ij * (1 - cos(delta_i - delta_j))
         """
         B_size = x.shape[0]
         N = self.N_NODES
 
-        # Get equilibrium
-        x_eq = self.goal_point.to(x.device)
-        if x_eq.shape[0] == 1 and B_size > 1:
-            x_eq = x_eq.expand(B_size, -1)
+        # Extract states
+        theta = x[:, :N-1]  # theta[i-1] = theta_1i = delta_1 - delta_i
+        omega = x[:, N-1:]
 
-        # Convert states and equilibrium to absolute angles (assuming delta_1=0)
-        delta = self.state_to_absolute_angles(x)
-        omega = x[:, N - 1 :]
-        delta_eq = self.state_to_absolute_angles(x_eq)
-        omega_eq = x_eq[:, N-1:] # Should be zero
-
-        # Kinetic energy (relative)
+        # Kinetic energy
         M_device = self.M.to(x.device)
-        H_kin = 0.5 * (M_device * (omega - omega_eq) ** 2).sum(1)
+        if M_device.dim() == 1:
+            M_device = M_device.unsqueeze(0)
+        T = 0.5 * (M_device * omega ** 2).sum(1)
 
-        # Potential energy (relative)
-        # H_pot = Sum_{i<j} B_ij * (cos(delta_i_eq-delta_j_eq) - cos(delta_i-delta_j))
-
-        # Calculate differences (delta_i - delta_j)
-        diff = delta.unsqueeze(2) - delta.unsqueeze(1)
-        diff_eq = delta_eq.unsqueeze(2) - delta_eq.unsqueeze(1)
+        # Potential energy - count each pair only once!
+        B = self.B_matrix.to(x.device)
+        V = torch.zeros(B_size, device=x.device)
         
-        B_matrix_device = self.B_matrix.to(x.device)
-        if B_matrix_device.dim() == 2:
-            B_matrix_device = B_matrix_device.unsqueeze(0) # (1, N, N)
+        # For all pairs (i,j) with i < j:
+        # delta_i - delta_j = ?
+        # delta_0 = 0 (reference)
+        # delta_i = -theta[i-1] for i > 0
         
-        # Calculate potential energy terms
-        potential_matrix = B_matrix_device * (torch.cos(diff_eq) - torch.cos(diff))
+        # Pairs involving machine 0
+        for j in range(1, N):
+            # delta_0 - delta_j = 0 - (-theta[j-1]) = theta[j-1]
+            V = V + B[0, j] * (1 - torch.cos(theta[:, j-1]))
         
-        # Sum over upper triangle (i<j)
-        H_pot = torch.triu(potential_matrix, diagonal=1).sum(dim=(1, 2))
-
-        V = H_kin + H_pot
+        # Pairs not involving machine 0  
+        for i in range(1, N):
+            for j in range(i+1, N):
+                # delta_i - delta_j = -theta[i-1] - (-theta[j-1]) = theta[j-1] - theta[i-1]
+                V = V + B[i, j] * (1 - torch.cos(theta[:, j-1] - theta[:, i-1]))
         
-        # Ensure non-negative due to numerical precision
-        V = torch.clamp(V, min=0.0)
-
-        return V
+        # Compute equilibrium energy
+        x_eq = self.goal_point.squeeze()
+        theta_eq = x_eq[:N-1]
+        
+        V_eq = 0.0
+        # Same structure for equilibrium
+        for j in range(1, N):
+            V_eq = V_eq + B[0, j] * (1 - torch.cos(theta_eq[j-1]))
+        
+        for i in range(1, N):
+            for j in range(i+1, N):
+                V_eq = V_eq + B[i, j] * (1 - torch.cos(theta_eq[j-1] - theta_eq[i-1]))
+        
+        # Total relative energy
+        E = T + (V - V_eq)
+        
+        return E
 
     @torch.no_grad()
     def collect_random_trajectories(
