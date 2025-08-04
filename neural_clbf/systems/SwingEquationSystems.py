@@ -162,7 +162,8 @@ class SwingEquationSystem(ControlAffineSystem):
             controller, 
             controller_period=controller_period,
             guard=guard,
-            params=params
+            params=params,
+            method=method
         )
 
     def validate_params(self, params: Scenario) -> bool:

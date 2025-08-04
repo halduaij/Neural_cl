@@ -17,7 +17,7 @@ class GPOpInfDynamics(nn.Module):
         self.include_quadratic = include_quadratic
         
         # Initialize A with stability bias (critical damping ≈ 0.1 s⁻¹)
-        self.A = nn.Parameter(torch.eye(d) * -0.1) 
+        self.A = nn.Parameter(torch.zeros(d, d))          # ← was  -0.1*I
         self.B = nn.Parameter(torch.zeros(d, m)) if m > 0 else None
         self.C = nn.Parameter(torch.zeros(d))
         

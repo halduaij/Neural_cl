@@ -24,7 +24,7 @@ def create_stable_system():
     # Use higher damping for stability
     D = torch.tensor([0.19666669, 0.28833333, 0.28833333, 0.28833333, 0.28833333,
                       0.28833333, 0.28833333, 0.28833333, 0.30366668, 0.30366668], 
-                     dtype=torch.float32) * 0.0  # 5x damping
+                     dtype=torch.float32)  # 5x damping
     
     P = torch.tensor([-0.19983394, -0.25653884, -0.25191885, -0.10242008, -0.34510365,
                        0.23206371, 0.4404325, 0.5896664, 0.26257738, -0.36892462], 
@@ -112,8 +112,8 @@ def simulate_trajectory(sys, x0, T_horizon, dt=None, controller=None):
         n_steps,
         controller=controller,
         controller_period=dt,  # Ensure controller period is at least dt
-        params=sys.nominal_params
-    )
+        params=sys.nominal_params,method="rk4")
+    
     
     return traj
 
@@ -283,31 +283,38 @@ def test_energy_consistency(sys, params):
     
     # Test 1: Energy gradient should match dynamics structure
     print("\n1. TESTING dE/dt = 0 for Hamiltonian flow:")
-    
+# -------------------------------------------------------------------------
+# 1. TESTING   dH/dt =  -ωᵀ D ω   (+  ωᵀ P_mech   if   P ≠ 0)
+# -------------------------------------------------------------------------
+    print("\n1. PORT‑HAMILTONIAN ENERGY‑RATE TEST:")
+
+    D_vec = sys.D.to(x_eq.device)                 # (N,)
+    P_vec = sys.P_mechanical.to(x_eq.device)      # (N,)
+
     for scale in [0.001, 0.01]:
-        errors = []
+        rel_errors = []
         for _ in range(10):
-            # Random test point
+            # random test point
             x_test = x_eq + scale * torch.randn_like(x_eq)
             x_test.requires_grad_(True)
-            
-            # Compute energy
-            E = sys.energy_function(x_test.unsqueeze(0)).squeeze()
-            
-            # Get dynamics
+
+            H = sys.energy_function(x_test.unsqueeze(0), relative=False).squeeze()
+
+            # dynamics
             f = sys._f(x_test.unsqueeze(0), params).squeeze()
-            
-            # For Hamiltonian system: dE/dt = ∇E · f = 0
-            grad_E = torch.autograd.grad(E, x_test, create_graph=True)[0]
-            dE_dt = (grad_E * f).sum()
-            
-            # Relative error
-            rel_error = abs(dE_dt.item()) / (E.item() + 1e-10)
-            errors.append(rel_error)
-            
-        print(f"   Scale {scale}: mean |dE/dt|/E = {np.mean(errors):.6e}")
-        if np.mean(errors) > 0.01:
-            print(f"      ⚠️  Energy is NOT conserved by the dynamics!")
+
+            # ∇H·f  from autograd
+            grad_H = torch.autograd.grad(H, x_test, create_graph=True)[0]
+            dH_dt  = (grad_H * f).sum()
+
+            # analytical RHS   −ωᵀ D ω   +   ωᵀ P
+            ω = x_test[sys.N_NODES-1:]            # last N components
+            rhs = -(D_vec * ω**2).sum() + (P_vec * ω).sum()
+
+            rel_errors.append( (dH_dt - rhs).abs() / (H.abs() + 1e-10) )
+
+        print(f"   scale {scale:4.3f}: mean |dH/dt – rhs| / |H|  =  {torch.tensor(rel_errors).mean():.3e}")
+
     
     # Test 2: Check specific structure for swing equations
     print("\n2. CHECKING SWING EQUATION ENERGY STRUCTURE:")
@@ -452,7 +459,7 @@ def test_trajectory_preservation():
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
             # Reduced system trajectory
-            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt,method="rk4")
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -504,7 +511,7 @@ def test_trajectory_preservation():
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
             # Reduced system trajectory
-            traj_rom = rollout_rom(opinf, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            traj_rom = rollout_rom(opinf, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt,method="rk4")
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -549,7 +556,7 @@ def test_trajectory_preservation():
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
             # Reduced system trajectory
-            traj_rom = rollout_rom(lcr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            traj_rom = rollout_rom(lcr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt,method="rk4")
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -661,41 +668,12 @@ def test_trajectory_preservation():
             traj = rollout_rom(reducer, sys, x0_plot.unsqueeze(0), int(T_horizon/dt), dt=dt)
         
         t = np.arange(traj.shape[1]) * dt
-        
-        # Plot angles (first 3)
-        plt.subplot(3, 2, 1)
-        for i in range(3):
-            plt.plot(t, traj[0, :, i].cpu().numpy(), 
-                    label=f'{name} θ_{i+2}' if idx == 0 else None,
-                    linestyle='-' if name == 'Full System' else '--')
-        plt.ylabel('Angle (rad)')
-        plt.title('Rotor Angles (first 3)')
-        if idx == 0:
-            plt.legend()
-        plt.grid(True)
-        
-        # Plot frequencies (first 3)
-        plt.subplot(3, 2, 2)
-        for i in range(3):
-            plt.plot(t, traj[0, :, 9+i].cpu().numpy(),
-                    label=f'{name} ω_{i+1}' if idx == 0 else None,
-                    linestyle='-' if name == 'Full System' else '--')
-        plt.ylabel('Frequency (rad/s)')
-        plt.title('Rotor Frequencies (first 3)')
-        if idx == 0:
-            plt.legend()
-        plt.grid(True)
-        
-        # Plot energy
-        plt.subplot(3, 2, 3)
-        E = V_fn(traj.reshape(-1, 19)).reshape(-1).cpu().numpy()
-        plt.plot(t, E, label=name, 
-                linestyle='-' if name == 'Full System' else '--')
-        plt.ylabel('Energy')
-        plt.xlabel('Time (s)')
-        plt.title('Total System Energy')
-        plt.legend()
-        plt.grid(True)
+        fig = plot_comparison(sys,
+                            {"SPR‑18": spr, "OpInf‑19": opinf, "LCR‑18": lcr},
+                            x0_plot, T_horizon, dt)
+        fig.savefig("trajectory_comparison.png", dpi=200)
+        print("Saved clearer figure to trajectory_comparison.png")
+
         
         # Plot energy error (if not full system)
         if name != 'Full System':
@@ -784,6 +762,100 @@ def verify_energy_function(sys, params):
     # Check if energy function uses relative or absolute form
     print(f"\nManual V = {V_manual:.6f}")
     print("Compare with energy components from actual implementation")
+# ---------------------------------------------------------------------
+# Improved visualisation – replace the old block that builds the figure
+# ---------------------------------------------------------------------
+import matplotlib as mpl
+mpl.rcParams.update({
+    "axes.prop_cycle": mpl.cycler(color=mpl.cm.tab10.colors),
+    "lines.linewidth": 1.8,
+    "axes.grid": True,
+    "grid.alpha": 0.3,
+})
+
+def plot_comparison(sys, reducers, x0, T_horizon, dt):
+    """Plot full vs ROM trajectories with clearer styling."""
+    fig, axs = plt.subplots(3, 2, figsize=(13, 9), constrained_layout=True)
+    t = np.arange(int(T_horizon/dt)+1) * dt
+
+    # --- helper -------------------------------------------------------
+    def rom_colour(idx):           # pick next colour for successive ROMs
+        base = mpl.cm.tab10.colors[idx % 10]
+        return (*base[:3], 0.7)    # slightly transparent
+
+    # --- simulate full system once -----------------------------------
+    traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
+    E_full = sys.energy_function(traj_full).cpu().numpy()
+
+    # plot helpers
+    labels_shown = {"angles": False, "freqs": False}
+
+    def add_trace(ax, y, label, style, c):
+        ax.plot(t, y, linestyle=style, color=c, label=label)
+
+    # --- angles & freqs ----------------------------------------------
+    for i in range(3):
+        add_trace(axs[0,0], traj_full[:, i].cpu(), rf"$\theta_{i+2}$ (full)", "-", rom_colour(i))
+        add_trace(axs[0,1], traj_full[:, 9+i].cpu(),  rf"$\omega_{i+1}$ (full)", "-", rom_colour(i))
+
+    # --- energy & errors containers ----------------------------------
+    axs[1,0].plot(t, E_full, "-", color="black", label="Full system")
+    axs[1,0].set_title("Total energy $H(t)$")
+    axs[1,0].set_ylabel("Joules")
+
+    axs[1,1].set_yscale("log")
+    axs[1,1].set_title("|Energy error|  &  ||x – x_ROM||")
+    axs[1,1].set_xlabel("Time [s]")
+
+    # --- each ROM -----------------------------------------------------
+    for k, (name, red) in enumerate(reducers.items(), start=1):
+        if red is None:
+            continue
+        traj_rom = rollout_rom(red, sys, x0.unsqueeze(0),
+                               int(T_horizon/dt), dt=dt,method="rk4")[0]
+        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+
+        c = rom_colour(k)
+        # angles / freqs dashed
+        for i in range(3):
+            add_trace(axs[0,0], traj_rom[:, i].cpu(),
+                      f"{name} θ_{i+2}" if not labels_shown["angles"] else None,
+                      "--", c)
+            add_trace(axs[0,1], traj_rom[:, 9+i].cpu(),
+                      f"{name} ω_{i+1}" if not labels_shown["freqs"] else None,
+                      "--", c)
+        labels_shown["angles"] = labels_shown["freqs"] = True
+
+        # energy
+        axs[1,0].plot(t, E_rom, "--", color=c, label=name)
+
+        # energy error + state error in the same log‑ax
+        axs[1,1].plot(t, np.abs(E_full - E_rom),
+                      "--", color=c, label=f"|ΔE| {name}")
+        state_err = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        axs[1,1].plot(t, state_err, ":", color=c, label=f"‖Δx‖ {name}")
+
+    # --- cosmetics ----------------------------------------------------
+    for ax in axs.flat:
+        ax.set_xlim(0, T_horizon)
+    axs[0,0].set_title("Rotor angles (first 3)")
+    axs[0,1].set_title("Rotor frequencies (first 3)")
+    axs[0,0].set_ylabel("rad")
+    axs[0,1].set_ylabel("rad s⁻¹")
+    axs[2,0].remove()                       # free one cell for a big legend
+    handles, labels = [], []
+    for ax in axs.flat:
+        h,l = ax.get_legend_handles_labels()
+        handles.extend(h); labels.extend(l)
+    axs[2,1].legend(handles, labels, ncol=3, fontsize=8,
+                    loc="center", frameon=False)
+    axs[2,1].axis("off")
+    fig.suptitle("Full vs reduced‑order swing dynamics (IEEE‑39, Δ0≈5 %)",
+                 fontsize=14, fontweight="bold")
+    return fig
+
+# ---------------------------------------------------------------------
+# call it
 
 if __name__ == "__main__":
     results, validation_results = test_trajectory_preservation()

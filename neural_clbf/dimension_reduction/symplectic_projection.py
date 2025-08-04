@@ -229,26 +229,14 @@ class SymplecticProjectionReducer(BaseReducer):
         
         # Build final basis respecting dimension budget
         basis_cols = []
-        for v, Jv in pairs:
-            if len(basis_cols) + 2 > self.latent_dim:
-                break
+        for i in range(self.latent_dim // 2):
+            v  = Q_combined[:, i]
+            v  = v / (v.norm() + 1e-10)
+            Jv = self.J_symplectic @ v
+            Jv = Jv / (Jv.norm() + 1e-10)
             basis_cols.extend([v, Jv])
-        
-        # Update latent_dim if we couldn't achieve the requested dimension
-        achieved_dim = len(basis_cols)
-        if achieved_dim < self.latent_dim:
-            warnings.warn(f"SPR returned d={achieved_dim} (requested {self.latent_dim}) "
-                         f"to preserve symplectic pairs")
-            self.latent_dim = achieved_dim
-        
-        if achieved_dim == 0:
-            raise ValueError("Could not build any symplectic pairs")
-        
         T = torch.stack(basis_cols, dim=1)
-        
-        # Final orthogonalization to ensure numerical orthogonality
-        T, _ = torch.linalg.qr(T)
-        
+        T, _ = torch.linalg.qr(T)                # final orthonormalisation
         return T
     
     def _score_modes(self, modes, X_data):

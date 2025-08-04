@@ -445,6 +445,8 @@ class ControlAffineSystem(ABC):
         controller_period: Optional[float] = None,
         guard: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         params: Optional[Scenario] = None,
+        *,
+        method: str = "rk4",          # ← NEW  ( "euler" | "rk4" )
     ) -> torch.Tensor:
         """
         Simulate the system for the specified number of steps using the given controller
@@ -473,7 +475,18 @@ class ControlAffineSystem(ABC):
         if controller_period is None:
             controller_period = self.dt
         controller_update_freq = max(1, int(controller_period / self.dt))
+        # Choose integrator once outside the loop
+        if method not in ("euler", "rk4"):
+            raise ValueError(f"simulate(): unknown method '{method}'")
 
+        def rk4_step(x, u):
+            """One RK‑4 step of width self.dt."""
+            f1 = self.closed_loop_dynamics(x,              u, params)
+            f2 = self.closed_loop_dynamics(x + 0.5*self.dt*f1, u, params)
+            f3 = self.closed_loop_dynamics(x + 0.5*self.dt*f2, u, params)
+            f4 = self.closed_loop_dynamics(x +     self.dt*f3, u, params)
+            return x + (self.dt/6.0)*(f1 + 2*f2 + 2*f3 + f4)
+        # ──────────────────────────────────────────────────────────────
         # Run the simulation until it's over or an error occurs
         t_sim_final = 0
         for tstep in range(1, num_steps):
@@ -486,8 +499,10 @@ class ControlAffineSystem(ABC):
 
                 # Simulate forward using the dynamics
                 xdot = self.closed_loop_dynamics(x_current, u, params)
-                x_sim[:, tstep, :] = x_current + self.dt * xdot
-
+                if method == "euler":
+                    x_sim[:, tstep, :] = x_current + self.dt * xdot
+                else:          # "rk4"
+                    x_sim[:, tstep, :] = rk4_step(x_current, u)
                 # If the guard is activated for any trajectory, reset that trajectory
                 # to a random state
                 if guard is not None:
