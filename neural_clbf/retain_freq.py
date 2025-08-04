@@ -63,7 +63,7 @@ def create_stable_system():
     return sys, params
 
 
-def collect_training_data(sys, params, n_samples=1000):
+def collect_training_data(sys, params, n_samples=4000):
     """Collect training data for reducers."""
     theta_eq = sys.delta_star[0] - sys.delta_star[1:]
     omega_eq = torch.zeros(10)
@@ -71,7 +71,7 @@ def collect_training_data(sys, params, n_samples=1000):
     
     # Small perturbations
     X = x_eq.unsqueeze(0).repeat(n_samples, 1)
-    X += 0.01 * torch.randn_like(X)
+    X += 0.3 * torch.randn_like(X)
     
     # Compute derivatives
     Xdot = []
@@ -93,7 +93,7 @@ def simulate_trajectory(sys, x0, T, dt=0.01, controller=None):
         x0.unsqueeze(0) if x0.dim() == 1 else x0,
         n_steps,
         controller=controller,
-        controller_period=dt , # Ensure controller period is at least dt
+        controller_period=dt, # Ensure controller period is at least dt
         params=sys.nominal_params
     )
     
@@ -180,8 +180,8 @@ def test_trajectory_preservation():
             # Full system trajectory
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
-            # Reduced system trajectory - FIX: correct parameter order and use integer steps
-            traj_rom = rollout_rom(sys, spr, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            # Reduced system trajectory - FIXED: correct parameter order
+            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -227,8 +227,8 @@ def test_trajectory_preservation():
             # Full system trajectory
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
-            # Reduced system trajectory - FIX: correct parameter order and use integer steps
-            traj_rom = rollout_rom(sys, opinf, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            # Reduced system trajectory - FIXED: correct parameter order
+            traj_rom = rollout_rom(opinf, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -262,6 +262,10 @@ def test_trajectory_preservation():
     print("\n3. Testing Lyapunov Coherency (k=9 groups → d=18):")
     lcr = None
     try:
+        # FIXED: Ensure X_train is a torch tensor on the correct device
+        if not torch.is_tensor(X_train):
+            X_train = torch.tensor(X_train, dtype=torch.float32)
+        
         lcr = LyapCoherencyReducer(sys, 9, X_train)
         lcr.full_dim = 19
         lcr.gamma = lcr.compute_gamma(V_min)
@@ -273,8 +277,8 @@ def test_trajectory_preservation():
             # Full system trajectory
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
-            # Reduced system trajectory - FIX: correct parameter order and use integer steps
-            traj_rom = rollout_rom(sys, lcr, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            # Reduced system trajectory - FIXED: correct parameter order
+            traj_rom = rollout_rom(lcr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt)
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -321,13 +325,12 @@ def test_trajectory_preservation():
             
         print(f"\nValidating {name}:")
         try:
-            # FIX: Use correct parameters
+            # FIXED: Use correct parameter name 'horizon' instead of 't_sim'
             val_metrics = validate_reducer(
                 sys, reducer, 
                 n_rollouts=50,
-                t_sim=2.0,  # FIX: correct parameter name
+                horizon=2.0,  # FIXED: was t_sim
                 dt=0.01
-                # Removed input_mode parameter that doesn't exist
             )
 
             validation_results[name] = val_metrics
@@ -383,8 +386,8 @@ def test_trajectory_preservation():
         if name == 'Full System':
             traj = simulate_trajectory(sys, x0_plot, T_horizon, dt)
         else:
-            # FIX: correct parameter order and use integer steps
-            traj = rollout_rom(sys, reducer, x0_plot.unsqueeze(0), int(T_horizon/dt), dt=dt)
+            # FIXED: correct parameter order
+            traj = rollout_rom(reducer, sys, x0_plot.unsqueeze(0), int(T_horizon/dt), dt=dt)
         
         t = np.arange(traj.shape[1]) * dt
         

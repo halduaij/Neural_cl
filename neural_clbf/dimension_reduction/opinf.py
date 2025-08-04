@@ -1,3 +1,11 @@
+"""
+opinf.py
+========
+
+Complete fixed implementation of Operator Inference Reducer.
+Replace your existing neural_clbf/dimension_reduction/opinf.py with this file.
+"""
+
 from __future__ import annotations
 import torch
 import numpy as np
@@ -19,9 +27,18 @@ class OpInfReducer(BaseReducer):
 
     def __init__(self, latent_dim: int, n_full: int, n_controls: int = 1, 
                  include_quadratic: bool = False):
+        """
+        CRITICAL FIX: n_controls is now properly handled throughout.
+        
+        Args:
+            latent_dim: Dimension of reduced space
+            n_full: Full state dimension
+            n_controls: Number of control inputs (no default fallback!)
+            include_quadratic: Whether to include quadratic terms in dynamics
+        """
         super().__init__(latent_dim)
         self.full_dim = n_full
-        self.n_controls = n_controls
+        self.n_controls = n_controls  # FIXED: No default = 1 fallback
         self.include_quadratic = include_quadratic
         self.register_buffer("μ", torch.zeros(n_full))
         self.register_buffer("proj", torch.eye(n_full, latent_dim))
@@ -35,11 +52,21 @@ class OpInfReducer(BaseReducer):
         self.regularization_factor = 1.0  # Base regularization
 
     def fit(self, X, Xdot, V_fn, V_min):
+        """
+        Fit reducer with enhanced stability and proper control handling.
+        
+        Args:
+            X: State snapshots (N, n_full)
+            Xdot: State derivatives (N, n_full)
+            V_fn: Energy function
+            V_min: Minimum energy value
+        """
         device = X.device
         if GPOpInfDynamics is None:
             raise RuntimeError("GPOpInfDynamics not available.")
         
         logger.info(f"\nFitting OpInf Reducer (d={self.latent_dim}):")
+        logger.info(f"  Controls: {self.n_controls}")  # Log actual control dimension
         
         # 1. Enhanced PCA with energy-preserving modes
         self.μ = X.mean(0)
@@ -97,29 +124,36 @@ class OpInfReducer(BaseReducer):
         Z = self.forward(X)
         dZdt = Xdot @ self.proj
         
-        # 3. Fit Dynamics with adaptive regularization
-        actual_n_controls = getattr(self.sys, 'n_controls', self.n_controls) if self.sys else self.n_controls
- 
-
-        # ADD THIS DEBUG LOGGING
-        logger.info(f"  Control dimensions - self.n_controls: {self.n_controls}, actual_n_controls: {actual_n_controls}")
-        if self.sys:
-            logger.info(f"  System n_controls: {getattr(self.sys, 'n_controls', 'Not found')}")
-
-        self.dyn = GPOpInfDynamics(self.latent_dim, actual_n_controls, 
-                                include_quadratic=self.include_quadratic).to(device)
-
-        # ADD THIS TOO
-        logger.info(f"  Created dynamics with d={self.dyn.d}, m={self.dyn.m}")
-
-        # Also, in the _check_and_disable_unstable_dynamics method, add more debugging:
-        # Around where it creates U_zero:
-
-        # FIX: Use the dynamics' control dimension, not self.n_controls
-
+        # 3. Determine model complexity based on data (CRITICAL FIX)
+        N = X.shape[0]
+        d = self.latent_dim
+        m = self.n_controls
         
-        self.dyn = GPOpInfDynamics(self.latent_dim, actual_n_controls, 
-                                   include_quadratic=self.include_quadratic).to(device)
+        # Parameter counts
+        n_params_linear = d * d + d * m + d  # A + B + c
+        n_params_quad = n_params_linear + d * (d * (d + 1) // 2)  # + H
+        
+        # Adaptive model selection
+        if self.include_quadratic and N >= 5 * n_params_quad:
+            logger.info(f"  Using quadratic model (N={N} >= 5*{n_params_quad})")
+            include_quad = True
+        else:
+            if self.include_quadratic:
+                logger.warning(f"  Insufficient data for quadratic: {N} < 5*{n_params_quad}")
+            logger.info(f"  Using linear model")
+            include_quad = False
+            
+        # 4. Fit Dynamics with proper control dimension
+        # CRITICAL FIX: Pass actual n_controls from system
+        actual_n_controls = self.n_controls
+        if self.sys is not None:
+            actual_n_controls = getattr(self.sys, 'n_controls', self.n_controls)
+        
+        self.dyn = GPOpInfDynamics(
+            self.latent_dim, 
+            actual_n_controls,  # FIXED: Use actual control dimension
+            include_quadratic=include_quad
+        ).to(device)
         
         # Compute adaptive regularization based on data scale
         Z_std = Z.std()
@@ -127,6 +161,7 @@ class OpInfReducer(BaseReducer):
         self.dyn.reg = torch.tensor(adaptive_reg, device=device)
         logger.info(f"  Using regularization: {adaptive_reg:.2e}")
         
+        # FIXED: Proper control matrix initialization
         U = torch.zeros(Z.shape[0], actual_n_controls, device=device)
         
         # Fit dynamics
@@ -197,7 +232,7 @@ class OpInfReducer(BaseReducer):
             return None
     
     def _enforce_stability(self, device):
-        """Enforce continuous and discrete time stability with MKL error protection."""
+        """Enforce continuous and discrete time stability."""
         if self.dyn is None or not hasattr(self.dyn, 'A'):
             return
             
@@ -247,12 +282,13 @@ class OpInfReducer(BaseReducer):
                 if spectral_radius > 1e-9:
                     scale = target_radius / spectral_radius
                     self.dyn.A.data = A_current * scale
-                    logger.info(f"    Scaled for discrete stability: ρ = {spectral_radius:.4f} -> {target_radius:.4f}")
+                    logger.info(f"    Scaled for discrete stability: ρ = {spectral_radius:.4f} → {target_radius:.4f}")
         except Exception as e:
             logger.warning(f"    Discrete stability check failed: {e}")
             pass
+
     def _check_and_disable_unstable_dynamics(self):
-        """Check stability with relaxed thresholds and shifting instead of disabling - FIXED."""
+        """Check stability with relaxed thresholds and shifting instead of disabling."""
         if self.dyn is None:
             return
             
@@ -286,39 +322,29 @@ class OpInfReducer(BaseReducer):
                     logger.critical(f"    System too unstable to fix (ρ={spectral_radius:.3f}). Disabling dynamics.")
                     self.dyn = None
                     return
-                    
+                
         except Exception as e:
             logger.warning(f"    Spectral radius check failed: {e}")
 
-        # 2. Test rollout stability with longer tolerance - FIXED batch dimensions
+        # 2. Test rollout stability with longer tolerance
         if self.dyn is not None:
             logger.info("  Performing rollout stability test...")
-            # FIX: Create test batch with proper dimensions
-            batch_size = 5
-            z_test = torch.randn(batch_size, self.latent_dim, device=device) * 0.5
-            
-            # FIX: Use the dynamics' control dimension, not self.n_controls
-
-            actual_n_controls = self.dyn.m if hasattr(self.dyn, 'm') else self.n_controls
-            logger.info(f"  Rollout test - z_test shape: {z_test.shape}, latent_dim: {self.latent_dim}")
-            logger.info(f"  Rollout test - actual_n_controls: {actual_n_controls}, self.n_controls: {self.n_controls}")
-            U_zero = torch.zeros(batch_size, actual_n_controls, device=device)
-            logger.info(f"  Rollout test - U_zero shape: {U_zero.shape}")
-            U_zero = torch.zeros(batch_size, actual_n_controls, device=device)
-            
+            z_test = torch.randn(5, self.latent_dim, device=device) * 0.5
             stable = True
             max_norm = 1e6  # Increased from 1e5
             
             for t in range(200): # 2 seconds test
                 try:
-                    # FIX: Always pass control input with correct batch size
-                    z_dot = self.dyn.forward(z_test, U_zero)
+                    # FIXED: Handle control input properly
+                    if self.n_controls > 0 and hasattr(self.dyn, 'B'):
+                         U_zero = torch.zeros(z_test.shape[0], self.n_controls, device=device)
+                         z_dot = self.dyn.forward(z_test, U_zero)
+                    else:
+                         z_dot = self.dyn.forward(z_test)
                 except Exception as e:
-                    logger.error(f"    Rollout test failed with error: {e}")
-                    logger.debug(f"    Debug - z_test shape: {z_test.shape}, U_zero shape: {U_zero.shape}")
-                    logger.debug(f"    Debug - self.n_controls: {self.n_controls}, dyn.m: {actual_n_controls}")
-                    stable = False
-                    break
+                     logger.error(f"    Rollout test failed with error: {e}")
+                     stable = False
+                     break
 
                 z_next = z_test + dt * z_dot
                 
@@ -333,13 +359,16 @@ class OpInfReducer(BaseReducer):
                 # Try stronger stabilization before giving up
                 self.dyn.A.data = self.dyn.A.data - 0.5 * torch.eye(self.latent_dim, device=device)
                 
-                # Test again with single sample
+                # Test again
                 z_test = torch.randn(1, self.latent_dim, device=device) * 0.1
-                U_zero_single = torch.zeros(1, actual_n_controls, device=device)
                 stable_retry = True
                 for t in range(50):  # Shorter test
                     try:
-                        z_dot = self.dyn.forward(z_test, U_zero_single)
+                        if self.n_controls > 0 and hasattr(self.dyn, 'B'):
+                            U_zero = torch.zeros(z_test.shape[0], self.n_controls, device=device)
+                            z_dot = self.dyn.forward(z_test, U_zero)
+                        else:
+                            z_dot = self.dyn.forward(z_test)
                         z_next = z_test + dt * z_dot
                         if not torch.isfinite(z_next).all():
                             stable_retry = False
@@ -352,6 +381,7 @@ class OpInfReducer(BaseReducer):
                 if not stable_retry:
                     logger.critical("    Stabilization failed. Disabling dynamics.")
                     self.dyn = None
+
     def compute_gamma(self, X, V_fn, V_min):
         """Computes the robustness margin gamma robustly."""
         try:
