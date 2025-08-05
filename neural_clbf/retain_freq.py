@@ -668,11 +668,6 @@ def test_trajectory_preservation():
             traj = rollout_rom(reducer, sys, x0_plot.unsqueeze(0), int(T_horizon/dt), dt=dt)
         
         t = np.arange(traj.shape[1]) * dt
-        fig = plot_comparison(sys,
-                            {"SPR‑18": spr, "OpInf‑19": opinf, "LCR‑18": lcr},
-                            x0_plot, T_horizon, dt)
-        fig.savefig("trajectory_comparison.png", dpi=200)
-        print("Saved clearer figure to trajectory_comparison.png")
 
         
         # Plot energy error (if not full system)
@@ -705,7 +700,42 @@ def test_trajectory_preservation():
     plt.tight_layout()
     plt.savefig('full_dimension_trajectories.png', dpi=150)
     print("\nTrajectory plots saved to 'full_dimension_trajectories.png'")
-    
+
+    plt.close()
+    print("\nTrajectory plots saved to 'full_dimension_trajectories.png'")
+
+    # Now create the comparison plots with unique filenames
+    print("\nGenerating comparison visualizations...")
+
+    # 1. Summary plot (2x2 clearer visualization)
+    fig_summary = plot_summary_comparison(sys,
+                        {"SPR-18": spr if 'spr' in locals() else None, 
+                        "OpInf-19": opinf if 'opinf' in locals() else None, 
+                        "LCR-18": lcr if 'lcr' in locals() else None},
+                        x0_plot, T_horizon, dt)
+    fig_summary.savefig("comparison_summary.png", dpi=150, bbox_inches='tight')
+    plt.close(fig_summary)
+    print("Saved summary plot to 'comparison_summary.png'")
+
+    # 2. Detailed comparison plot
+    fig_comp = plot_comparison(sys,
+                        {"SPR-18": spr if 'spr' in locals() else None, 
+                        "OpInf-19": opinf if 'opinf' in locals() else None, 
+                        "LCR-18": lcr if 'lcr' in locals() else None},
+                        x0_plot, T_horizon, dt)
+    fig_comp.savefig("comparison_detailed.png", dpi=200, bbox_inches='tight')
+    plt.close(fig_comp)
+    print("Saved detailed comparison to 'comparison_detailed.png'")
+
+    # 3. Individual method comparison (one row per reducer)
+    fig_individual = plot_individual_comparison(sys,
+                        {"SPR-18": spr if 'spr' in locals() else None, 
+                        "OpInf-19": opinf if 'opinf' in locals() else None, 
+                        "LCR-18": lcr if 'lcr' in locals() else None},
+                        x0_plot, T_horizon, dt)
+    fig_individual.savefig("comparison_individual_methods.png", dpi=150, bbox_inches='tight')
+    plt.close(fig_individual)
+    print("Saved individual method comparison to 'comparison_individual_methods.png'")    
     return results, validation_results
 def verify_energy_function(sys, params):
     """Thoroughly check energy function consistency"""
@@ -856,10 +886,263 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
     fig.suptitle("Full vs reduced‑order swing dynamics (IEEE‑39, Δ0≈5 %)",
                  fontsize=14, fontweight="bold")
     return fig
+def plot_comparison_clear(sys, reducers, x0, T_horizon, dt):
+    """Create a clearer comparison plot with separate subplots for each ROM."""
+    
+    # Simulate full system once
+    traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
+    E_full = sys.energy_function(traj_full).cpu().numpy()
+    n_points = traj_full.shape[0]
+    t = np.arange(n_points) * dt
+    
+    # Create figure with subplots for each ROM
+    n_roms = len([r for r in reducers.values() if r is not None])
+    fig = plt.figure(figsize=(16, 4 * n_roms))
+    
+    # Color scheme
+    colors = {
+        'full': 'black',
+        'SPR-18': '#1f77b4',
+        'OpInf-19': '#ff7f0e', 
+        'LCR-18': '#2ca02c'
+    }
+    
+    for idx, (name, reducer) in enumerate(reducers.items()):
+        if reducer is None:
+            continue
+            
+        # Simulate ROM
+        traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
+        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        
+        # Create subplot row
+        row_idx = idx * 4
+        
+        # 1. Angles comparison
+        ax1 = plt.subplot(n_roms, 4, row_idx + 1)
+        # Plot only first angle for clarity
+        ax1.plot(t, traj_full[:, 0].cpu(), 'k-', label='Full', linewidth=2)
+        ax1.plot(t, traj_rom[:, 0].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax1.set_ylabel('θ_{1,2} [rad]')
+        ax1.set_title(f'{name}: First relative angle')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Frequencies comparison
+        ax2 = plt.subplot(n_roms, 4, row_idx + 2)
+        # Plot only first frequency
+        ax2.plot(t, traj_full[:, 9].cpu(), 'k-', label='Full', linewidth=2)
+        ax2.plot(t, traj_rom[:, 9].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax2.set_ylabel('ω_1 [rad/s]')
+        ax2.set_title(f'{name}: First frequency')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. Energy
+        ax3 = plt.subplot(n_roms, 4, row_idx + 3)
+        ax3.plot(t, E_full, 'k-', label='Full', linewidth=2)
+        ax3.plot(t, E_rom, '--', color=colors[name], label=name, linewidth=2)
+        ax3.set_ylabel('Energy')
+        ax3.set_title(f'{name}: Total energy')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. Errors (log scale)
+        ax4 = plt.subplot(n_roms, 4, row_idx + 4)
+        energy_error = np.abs(E_full - E_rom)
+        state_error = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        
+        ax4.semilogy(t, energy_error, '-', color=colors[name], label='Energy error', linewidth=2)
+        ax4.semilogy(t, state_error, '--', color=colors[name], label='State error', linewidth=2)
+        ax4.set_ylabel('Error')
+        ax4.set_xlabel('Time [s]')
+        ax4.set_title(f'{name}: Errors')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        ax4.set_ylim([1e-6, 1e0])
+    
+    plt.suptitle('Trajectory Preservation Test: Full vs Reduced-Order Models', fontsize=16)
+    plt.tight_layout()
+    return fig
 
-# ---------------------------------------------------------------------
-# call it
 
+def plot_summary_comparison(sys, reducers, x0, T_horizon, dt):
+    """Create a summary plot focusing on key differences."""
+    
+    # Simulate full system
+    traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
+    E_full = sys.energy_function(traj_full).cpu().numpy()
+    n_points = traj_full.shape[0]
+    t = np.arange(n_points) * dt
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    # Color scheme with better distinction
+    colors = {
+        'SPR-18': '#1f77b4',
+        'OpInf-19': '#ff7f0e', 
+        'LCR-18': '#d62728'  # Red for the problematic one
+    }
+    
+    # Store all errors for y-axis scaling
+    all_energy_errors = []
+    all_state_errors = []
+    
+    # Plot 1: State norm evolution
+    ax = axes[0, 0]
+    state_norm_full = traj_full.norm(dim=1).cpu().numpy()
+    ax.plot(t, state_norm_full, 'k-', label='Full system', linewidth=2.5)
+    
+    for name, reducer in reducers.items():
+        if reducer is None:
+            continue
+        traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
+        state_norm_rom = traj_rom.norm(dim=1).cpu().numpy()
+        ax.plot(t, state_norm_rom, '--', color=colors[name], label=name, linewidth=2)
+    
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('||x||')
+    ax.set_title('State Norm Evolution')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 2: Energy conservation
+    ax = axes[0, 1]
+    ax.plot(t, E_full, 'k-', label='Full system', linewidth=2.5)
+    
+    for name, reducer in reducers.items():
+        if reducer is None:
+            continue
+        traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
+        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        ax.plot(t, E_rom, '--', color=colors[name], label=name, linewidth=2)
+    
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('Energy')
+    ax.set_title('Energy Conservation')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 3: Energy errors (log scale)
+    ax = axes[1, 0]
+    for name, reducer in reducers.items():
+        if reducer is None:
+            continue
+        traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
+        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        energy_error = np.abs(E_full - E_rom)
+        all_energy_errors.append(energy_error)
+        ax.semilogy(t, energy_error, '-', color=colors[name], label=name, linewidth=2)
+    
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('|Energy Error|')
+    ax.set_title('Energy Conservation Error')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    if all_energy_errors:
+        ax.set_ylim([1e-6, max([e.max() for e in all_energy_errors]) * 2])
+    
+    # Plot 4: State errors (log scale)
+    ax = axes[1, 1]
+    for name, reducer in reducers.items():
+        if reducer is None:
+            continue
+        traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
+        state_error = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        all_state_errors.append(state_error)
+        ax.semilogy(t, state_error, '-', color=colors[name], label=name, linewidth=2)
+    
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('||x_{full} - x_{ROM}||')
+    ax.set_title('State Reconstruction Error')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    if all_state_errors:
+        ax.set_ylim([1e-6, max([e.max() for e in all_state_errors]) * 2])
+    
+    plt.suptitle('Summary: Reduced-Order Model Performance', fontsize=14)
+    plt.tight_layout()
+    return fig
+def plot_individual_comparison(sys, reducers, x0, T_horizon, dt):
+    """Create a detailed plot with separate rows for each reducer."""
+    
+    # Simulate full system once
+    traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
+    E_full = sys.energy_function(traj_full).cpu().numpy()
+    n_points = traj_full.shape[0]
+    t = np.arange(n_points) * dt
+    
+    # Count active reducers
+    active_reducers = [(name, red) for name, red in reducers.items() if red is not None]
+    n_reducers = len(active_reducers)
+    
+    # Create figure with subplots for each reducer
+    fig, axes = plt.subplots(n_reducers, 4, figsize=(16, 4*n_reducers))
+    if n_reducers == 1:
+        axes = axes.reshape(1, -1)
+    
+    # Color scheme
+    colors = {
+        'SPR-18': '#1f77b4',    # Blue
+        'OpInf-19': '#ff7f0e',  # Orange
+        'LCR-18': '#d62728'     # Red
+    }
+    
+    for idx, (name, reducer) in enumerate(active_reducers):
+        # Simulate ROM
+        traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
+        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        
+        # 1. Angles comparison
+        ax = axes[idx, 0]
+        # Plot only first angle for clarity
+        ax.plot(t, traj_full[:, 0].cpu(), 'k-', label='Full', linewidth=2)
+        ax.plot(t, traj_rom[:, 0].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax.set_ylabel('θ_{1,2} [rad]')
+        ax.set_title(f'{name}: First relative angle')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 2. Frequencies comparison
+        ax = axes[idx, 1]
+        # Plot only first frequency
+        ax.plot(t, traj_full[:, 9].cpu(), 'k-', label='Full', linewidth=2)
+        ax.plot(t, traj_rom[:, 9].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax.set_ylabel('ω_1 [rad/s]')
+        ax.set_title(f'{name}: First frequency')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 3. Energy
+        ax = axes[idx, 2]
+        ax.plot(t, E_full, 'k-', label='Full', linewidth=2)
+        ax.plot(t, E_rom, '--', color=colors[name], label=name, linewidth=2)
+        ax.set_ylabel('Energy')
+        ax.set_title(f'{name}: Total energy')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 4. Errors (log scale)
+        ax = axes[idx, 3]
+        energy_error = np.abs(E_full - E_rom)
+        state_error = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        
+        ax.semilogy(t, energy_error, '-', color=colors[name], label='Energy error', linewidth=2)
+        ax.semilogy(t, state_error, '--', color=colors[name], label='State error', linewidth=2)
+        ax.set_ylabel('Error')
+        ax.set_xlabel('Time [s]')
+        ax.set_title(f'{name}: Errors')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([1e-6, 1e0])
+    
+    # Add labels for the bottom row
+    for i in range(4):
+        axes[-1, i].set_xlabel('Time [s]')
+    
+    plt.suptitle('Detailed Comparison: Full vs Reduced-Order Models', fontsize=16)
+    plt.tight_layout()
+    return fig
 if __name__ == "__main__":
     results, validation_results = test_trajectory_preservation()
     
