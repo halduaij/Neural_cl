@@ -602,66 +602,47 @@ class SwingEquationSystem(ControlAffineSystem):
         relative: bool = True,
     ) -> torch.Tensor:
         """
-        Hamiltonian (kinetic + potential) of the n‑machine swing system.
-
-        Parameters
-        ----------
-        x : (B, n_dims) or (n_dims,) tensor
-            State in *relative‑angle* coordinates
-            ``x = [θ_12 … θ_1n, ω_1 … ω_n]``.
-        relative : bool, default **True**
-            • ``True``  – return the **Lyapunov candidate**
-
-                  V_rel = T + (V – V_eq)
-
-              so V_rel(x_eq)=0.
-
-            • ``False`` – return the **absolute Hamiltonian**
-
-                  H = T + V
-
-              so H(x_eq)=T_eq+V_eq = V_eq.
-
-        Notes
-        -----
-        *The only difference from the old code is the extra keyword and the
-        caching of V_eq; the numerical expressions are unchanged.*
+        Hamiltonian (kinetic + potential) of the n-machine swing system.
+        FIXED to be safe for automatic differentiation.
         """
-        # ---- tensor hygiene --------------------------------------------------
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        Bsz, N_tot = x.shape
-        assert N_tot == self.N_DIMS, f"expected {self.N_DIMS}-vector, got {N_tot}"
+        Bsz = x.shape[0]
         device, dtype = x.device, x.dtype
         n = self.N_NODES
 
-        θ_rel = x[:, : n - 1]                 # (B, n‑1)
-        ω      = x[:, n - 1:]                 # (B, n)
+        theta_rel = x[:, : n - 1]
+        omega = x[:, n - 1:]
 
-        # ---- kinetic energy --------------------------------------------------
-        T = 0.5 * (self.M.to(device, dtype) * ω**2).sum(dim=1)   # (B,)
+        # Kinetic energy
+        T = 0.5 * (self.M.to(device, dtype) * omega**2).sum(dim=1)
 
-        # ---- potential energy (count each i<j once) --------------------------
-        δ = torch.zeros(Bsz, n, device=device, dtype=dtype)      # δ_1 = 0
-        δ[:, 1:] = -θ_rel                                        # δ_i = −θ_1i
+        # BUG FIX: Construct the absolute angles tensor using torch.cat
+        # to ensure the computation graph is not broken for autograd.
+        # The previous in-place modification `δ[:, 1:] = -θ_rel` was the source of the error.
+        delta_ref = torch.zeros(Bsz, 1, device=device, dtype=dtype)
+        delta_abs = torch.cat([delta_ref, -theta_rel], dim=1)
 
-        Δ = δ.unsqueeze(2) - δ.unsqueeze(1)                      # (B,n,n)
-
+        # Potential energy
+        delta_diff = delta_abs.unsqueeze(2) - delta_abs.unsqueeze(1)
         mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=device), 1)
-        V = ( self.B_matrix.to(device, dtype)[mask] *
-              (1.0 - torch.cos(Δ[:, mask])) ).sum(dim=1)         # (B,)
+        V = (self.B_matrix.to(device, dtype)[mask] * \
+             (1.0 - torch.cos(delta_diff[:, mask]))).sum(dim=1)
 
-        # ---- subtract equilibrium offset if asked for -----------------------
         if relative:
+            # This part uses .detach() so it's safe for autograd
             if not hasattr(self, "_V_eq_cache"):
-                θ_eq = self.goal_point.squeeze()[: n - 1]        # (n‑1,)
-                δ_eq = torch.zeros(n, device=device, dtype=dtype)
-                δ_eq[1:] = -θ_eq
-                Δ_eq = δ_eq.unsqueeze(1) - δ_eq.unsqueeze(0)
-                V_eq = ( self.B_matrix.to(device, dtype)[mask] *
-                         (1.0 - torch.cos(Δ_eq[mask])) ).sum()
+                x_eq = self.goal_point.to(device, dtype)
+                theta_eq = x_eq[:, :n - 1]
+                
+                delta_ref_eq = torch.zeros(1, 1, device=device, dtype=dtype)
+                delta_abs_eq = torch.cat([delta_ref_eq, -theta_eq], dim=1)
+                
+                delta_diff_eq = delta_abs_eq.unsqueeze(2) - delta_abs_eq.unsqueeze(1)
+                V_eq = (self.B_matrix.to(device, dtype)[mask] * \
+                        (1.0 - torch.cos(delta_diff_eq[:, mask]))).sum()
                 self._V_eq_cache = V_eq.detach()
-            V = V - self._V_eq_cache.to(device)
+            V = V - self._V_eq_cache
 
         return T + V
 
@@ -858,8 +839,10 @@ class SwingEquationSystem(ControlAffineSystem):
             
             # R matrix (damping)
             D = self.D.to(device)
+            M = self.M.to(device) # Get the inertia tensor
+
             for i in range(N):
-                R[N-1+i, N-1+i] = D[i]
+                R[N - 1 + i, N - 1 + i] = D[i] / M[i]
             
             return A, J, R
         else:

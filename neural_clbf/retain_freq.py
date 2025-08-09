@@ -78,7 +78,7 @@ def create_stable_system():
     return sys, params
 
 
-def collect_training_data(sys, params, n_samples=1000):
+def collect_training_data(sys, params, n_samples= 15000):
     """Collect training data for reducers."""
     theta_eq = sys.delta_star[0] - sys.delta_star[1:]
     omega_eq = torch.zeros(10)
@@ -86,7 +86,7 @@ def collect_training_data(sys, params, n_samples=1000):
     
     # Small perturbations
     X = x_eq.unsqueeze(0).repeat(n_samples, 1)
-    X += 0.05 * torch.randn_like(X)
+    X += 0.01 * torch.randn_like(X)
     
     # Compute derivatives
     Xdot = []
@@ -313,7 +313,7 @@ def test_energy_consistency(sys, params):
 
             rel_errors.append( (dH_dt - rhs).abs() / (H.abs() + 1e-10) )
 
-        print(f"   scale {scale:4.3f}: mean |dH/dt – rhs| / |H|  =  {torch.tensor(rel_errors).mean():.3e}")
+        print(f"   scale {scale:4.3f}: mean |dH/dt – rhs| / |H|  =  {torch.tensor(rel_errors).mean():.3e}")
 
     
     # Test 2: Check specific structure for swing equations
@@ -417,7 +417,7 @@ def test_trajectory_preservation():
     V_min = V_fn(X_train).min().item()
     
     # Test parameters
-    T_horizon = 2.0  # 2 second simulation
+    T_horizon = 4.0  # 2 second simulation
     dt = sys.dt      # Use system's dt
     n_test_trajectories = 5
     
@@ -447,7 +447,7 @@ def test_trajectory_preservation():
     try:
         A, J, R = sys.linearise(return_JR=True)
         # Try with enhanced=False to see if it preserves symplectic structure better
-        spr = SymplecticProjectionReducer(A, J, R, 18, enhanced=True)
+        spr = SymplecticProjectionReducer(sys,A, J, R, 18, enhanced=True)
         spr.full_dim = 19
         
         # Simulate trajectories
@@ -459,7 +459,7 @@ def test_trajectory_preservation():
             traj_full = simulate_trajectory(sys, x0, T_horizon, dt)
             
             # Reduced system trajectory
-            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt,method="rk4")
+            traj_rom = rollout_rom(spr, sys, x0.unsqueeze(0), int(T_horizon/dt), dt=dt, method="symplectic")
             
             # Ensure same length
             min_len = min(traj_full.shape[1], traj_rom.shape[1])
@@ -470,9 +470,9 @@ def test_trajectory_preservation():
             traj_error = (traj_full - traj_rom).norm(dim=-1).mean().item()
             errors.append(traj_error)
             
-            # Energy error
-            E_full = V_fn(traj_full.reshape(-1, 19)).reshape(traj_full.shape[0], -1)
-            E_rom = V_fn(traj_rom.reshape(-1, 19)).reshape(traj_rom.shape[0], -1)
+            # Energy error - Keep as torch tensors for consistency
+            E_full = V_fn(traj_full[:, :min_len].reshape(-1, 19)).reshape(-1)
+            E_rom = V_fn(traj_rom[:, :min_len].reshape(-1, 19)).reshape(-1)
             energy_error = (E_full - E_rom).abs().mean().item()
             energy_errors.append(energy_error)
             
@@ -675,9 +675,10 @@ def test_trajectory_preservation():
             plt.subplot(3, 2, 4)
             traj_full = simulate_trajectory(sys, x0_plot, T_horizon, dt)
             min_len = min(traj_full.shape[1], traj.shape[1])
-            E_full = V_fn(traj_full[:, :min_len].reshape(-1, 19)).reshape(-1).cpu().numpy()
-            E_rom = V_fn(traj[:, :min_len].reshape(-1, 19)).reshape(-1).cpu().numpy()
-            plt.semilogy(t[:min_len], np.abs(E_full - E_rom), label=name)
+            E_full = V_fn(traj_full[:, :min_len].reshape(-1, 19)).reshape(-1)
+            E_rom = V_fn(traj_rom[:, :min_len].reshape(-1, 19)).reshape(-1)
+            energy_diff = (E_full - E_rom).abs().detach().cpu().numpy()
+            plt.semilogy(t[:min_len], energy_diff, label=name)
             plt.ylabel('|Energy Error|')
             plt.xlabel('Time (s)')
             plt.title('Energy Conservation Error')
@@ -689,7 +690,7 @@ def test_trajectory_preservation():
             plt.subplot(3, 2, 5)
             traj_full = simulate_trajectory(sys, x0_plot, T_horizon, dt)
             min_len = min(traj_full.shape[1], traj.shape[1])
-            error = (traj_full[:, :min_len] - traj[:, :min_len]).norm(dim=-1).squeeze().cpu().numpy()
+            error = (traj_full[:, :min_len] - traj[:, :min_len]).norm(dim=-1).squeeze().detach().cpu().numpy()
             plt.semilogy(t[:min_len], error, label=name)
             plt.ylabel('||x_full - x_rom||')
             plt.xlabel('Time (s)')
@@ -813,7 +814,7 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
 
     # --- simulate full system once -----------------------------------
     traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
-    E_full = sys.energy_function(traj_full).cpu().numpy()
+    E_full = sys.energy_function(traj_full).detach().cpu().numpy()
     
     # Create time array that matches trajectory length
     n_points = traj_full.shape[0]
@@ -827,8 +828,8 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
 
     # --- angles & freqs ----------------------------------------------
     for i in range(3):
-        add_trace(axs[0,0], traj_full[:, i].cpu(), rf"$\theta_{{1,{i+2}}}$ (full)", "-", rom_colour(i))
-        add_trace(axs[0,1], traj_full[:, 9+i].cpu(), rf"$\omega_{{{i+1}}}$ (full)", "-", rom_colour(i))
+        add_trace(axs[0,0], traj_full[:, i].detach().cpu(), rf"$\theta_{{1,{i+2}}}$ (full)", "-", rom_colour(i))
+        add_trace(axs[0,1], traj_full[:, 9+i].detach().cpu(), rf"$\omega_{{{i+1}}}$ (full)", "-", rom_colour(i))
 
     # --- energy & errors containers ----------------------------------
     axs[1,0].plot(t, E_full, "-", color="black", label="Full system")
@@ -846,15 +847,15 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
         # Use n_points-1 steps to get n_points total (including initial condition)
         traj_rom = rollout_rom(red, sys, x0.unsqueeze(0),
                                n_points-1, dt=dt, method="rk4")[0]
-        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        E_rom = sys.energy_function(traj_rom).detach().cpu().numpy()
 
         c = rom_colour(k)
         # angles / freqs dashed
         for i in range(3):
-            add_trace(axs[0,0], traj_rom[:, i].cpu(),
+            add_trace(axs[0,0], traj_rom[:, i].detach().cpu(),
                       f"{name} θ_{{1,{i+2}}}" if not labels_shown["angles"] else None,
                       "--", c)
-            add_trace(axs[0,1], traj_rom[:, 9+i].cpu(),
+            add_trace(axs[0,1], traj_rom[:, 9+i].detach().cpu(),
                       f"{name} ω_{{{i+1}}}" if not labels_shown["freqs"] else None,
                       "--", c)
         labels_shown["angles"] = labels_shown["freqs"] = True
@@ -865,7 +866,7 @@ def plot_comparison(sys, reducers, x0, T_horizon, dt):
         # energy error + state error in the same log‑ax
         axs[1,1].plot(t, np.abs(E_full - E_rom),
                       "--", color=c, label=f"|ΔE| {name}")
-        state_err = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        state_err = (traj_full - traj_rom).norm(dim=1).detach().cpu().numpy()
         axs[1,1].plot(t, state_err, ":", color=c, label=f"‖Δx‖ {name}")
 
     # --- cosmetics ----------------------------------------------------
@@ -891,7 +892,7 @@ def plot_comparison_clear(sys, reducers, x0, T_horizon, dt):
     
     # Simulate full system once
     traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
-    E_full = sys.energy_function(traj_full).cpu().numpy()
+    E_full = sys.energy_function(traj_full).detach().cpu().numpy()
     n_points = traj_full.shape[0]
     t = np.arange(n_points) * dt
     
@@ -913,7 +914,7 @@ def plot_comparison_clear(sys, reducers, x0, T_horizon, dt):
             
         # Simulate ROM
         traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
-        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        E_rom = sys.energy_function(traj_rom).detach().cpu().numpy()
         
         # Create subplot row
         row_idx = idx * 4
@@ -921,8 +922,8 @@ def plot_comparison_clear(sys, reducers, x0, T_horizon, dt):
         # 1. Angles comparison
         ax1 = plt.subplot(n_roms, 4, row_idx + 1)
         # Plot only first angle for clarity
-        ax1.plot(t, traj_full[:, 0].cpu(), 'k-', label='Full', linewidth=2)
-        ax1.plot(t, traj_rom[:, 0].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax1.plot(t, traj_full[:, 0].detach().cpu(), 'k-', label='Full', linewidth=2)
+        ax1.plot(t, traj_rom[:, 0].detach().cpu(), '--', color=colors[name], label=name, linewidth=2)
         ax1.set_ylabel('θ_{1,2} [rad]')
         ax1.set_title(f'{name}: First relative angle')
         ax1.legend()
@@ -931,8 +932,8 @@ def plot_comparison_clear(sys, reducers, x0, T_horizon, dt):
         # 2. Frequencies comparison
         ax2 = plt.subplot(n_roms, 4, row_idx + 2)
         # Plot only first frequency
-        ax2.plot(t, traj_full[:, 9].cpu(), 'k-', label='Full', linewidth=2)
-        ax2.plot(t, traj_rom[:, 9].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax2.plot(t, traj_full[:, 9].detach().cpu(), 'k-', label='Full', linewidth=2)
+        ax2.plot(t, traj_rom[:, 9].detach().cpu(), '--', color=colors[name], label=name, linewidth=2)
         ax2.set_ylabel('ω_1 [rad/s]')
         ax2.set_title(f'{name}: First frequency')
         ax2.legend()
@@ -950,7 +951,7 @@ def plot_comparison_clear(sys, reducers, x0, T_horizon, dt):
         # 4. Errors (log scale)
         ax4 = plt.subplot(n_roms, 4, row_idx + 4)
         energy_error = np.abs(E_full - E_rom)
-        state_error = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        state_error = (traj_full - traj_rom).norm(dim=1).detach().cpu().numpy()
         
         ax4.semilogy(t, energy_error, '-', color=colors[name], label='Energy error', linewidth=2)
         ax4.semilogy(t, state_error, '--', color=colors[name], label='State error', linewidth=2)
@@ -971,7 +972,7 @@ def plot_summary_comparison(sys, reducers, x0, T_horizon, dt):
     
     # Simulate full system
     traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
-    E_full = sys.energy_function(traj_full).cpu().numpy()
+    E_full = sys.energy_function(traj_full).detach().cpu().numpy()
     n_points = traj_full.shape[0]
     t = np.arange(n_points) * dt
     
@@ -990,14 +991,14 @@ def plot_summary_comparison(sys, reducers, x0, T_horizon, dt):
     
     # Plot 1: State norm evolution
     ax = axes[0, 0]
-    state_norm_full = traj_full.norm(dim=1).cpu().numpy()
+    state_norm_full = traj_full.norm(dim=1).detach().cpu().numpy()
     ax.plot(t, state_norm_full, 'k-', label='Full system', linewidth=2.5)
     
     for name, reducer in reducers.items():
         if reducer is None:
             continue
         traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
-        state_norm_rom = traj_rom.norm(dim=1).cpu().numpy()
+        state_norm_rom = traj_rom.norm(dim=1).detach().cpu().numpy()
         ax.plot(t, state_norm_rom, '--', color=colors[name], label=name, linewidth=2)
     
     ax.set_xlabel('Time [s]')
@@ -1014,7 +1015,7 @@ def plot_summary_comparison(sys, reducers, x0, T_horizon, dt):
         if reducer is None:
             continue
         traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
-        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        E_rom = sys.energy_function(traj_rom).detach().cpu().numpy()
         ax.plot(t, E_rom, '--', color=colors[name], label=name, linewidth=2)
     
     ax.set_xlabel('Time [s]')
@@ -1029,7 +1030,7 @@ def plot_summary_comparison(sys, reducers, x0, T_horizon, dt):
         if reducer is None:
             continue
         traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
-        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        E_rom = sys.energy_function(traj_rom).detach().cpu().numpy()
         energy_error = np.abs(E_full - E_rom)
         all_energy_errors.append(energy_error)
         ax.semilogy(t, energy_error, '-', color=colors[name], label=name, linewidth=2)
@@ -1048,7 +1049,7 @@ def plot_summary_comparison(sys, reducers, x0, T_horizon, dt):
         if reducer is None:
             continue
         traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
-        state_error = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        state_error = (traj_full - traj_rom).norm(dim=1).detach().cpu().numpy()
         all_state_errors.append(state_error)
         ax.semilogy(t, state_error, '-', color=colors[name], label=name, linewidth=2)
     
@@ -1068,7 +1069,7 @@ def plot_individual_comparison(sys, reducers, x0, T_horizon, dt):
     
     # Simulate full system once
     traj_full = simulate_trajectory(sys, x0, T_horizon, dt)[0]
-    E_full = sys.energy_function(traj_full).cpu().numpy()
+    E_full = sys.energy_function(traj_full).detach().cpu().numpy()
     n_points = traj_full.shape[0]
     t = np.arange(n_points) * dt
     
@@ -1091,13 +1092,13 @@ def plot_individual_comparison(sys, reducers, x0, T_horizon, dt):
     for idx, (name, reducer) in enumerate(active_reducers):
         # Simulate ROM
         traj_rom = rollout_rom(reducer, sys, x0.unsqueeze(0), n_points-1, dt=dt, method="rk4")[0]
-        E_rom = sys.energy_function(traj_rom).cpu().numpy()
+        E_rom = sys.energy_function(traj_rom).detach().cpu().numpy()
         
         # 1. Angles comparison
         ax = axes[idx, 0]
         # Plot only first angle for clarity
-        ax.plot(t, traj_full[:, 0].cpu(), 'k-', label='Full', linewidth=2)
-        ax.plot(t, traj_rom[:, 0].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax.plot(t, traj_full[:, 0].detach().cpu(), 'k-', label='Full', linewidth=2)
+        ax.plot(t, traj_rom[:, 0].detach().cpu(), '--', color=colors[name], label=name, linewidth=2)
         ax.set_ylabel('θ_{1,2} [rad]')
         ax.set_title(f'{name}: First relative angle')
         ax.legend()
@@ -1106,8 +1107,8 @@ def plot_individual_comparison(sys, reducers, x0, T_horizon, dt):
         # 2. Frequencies comparison
         ax = axes[idx, 1]
         # Plot only first frequency
-        ax.plot(t, traj_full[:, 9].cpu(), 'k-', label='Full', linewidth=2)
-        ax.plot(t, traj_rom[:, 9].cpu(), '--', color=colors[name], label=name, linewidth=2)
+        ax.plot(t, traj_full[:, 9].detach().cpu(), 'k-', label='Full', linewidth=2)
+        ax.plot(t, traj_rom[:, 9].detach().cpu(), '--', color=colors[name], label=name, linewidth=2)
         ax.set_ylabel('ω_1 [rad/s]')
         ax.set_title(f'{name}: First frequency')
         ax.legend()
@@ -1125,7 +1126,7 @@ def plot_individual_comparison(sys, reducers, x0, T_horizon, dt):
         # 4. Errors (log scale)
         ax = axes[idx, 3]
         energy_error = np.abs(E_full - E_rom)
-        state_error = (traj_full - traj_rom).norm(dim=1).cpu().numpy()
+        state_error = (traj_full - traj_rom).norm(dim=1).detach().cpu().numpy()
         
         ax.semilogy(t, energy_error, '-', color=colors[name], label='Energy error', linewidth=2)
         ax.semilogy(t, state_error, '--', color=colors[name], label='State error', linewidth=2)
@@ -1173,4 +1174,3 @@ if __name__ == "__main__":
     else:
         print("\nSome reducers failed to preserve trajectories adequately.")
         print("This may indicate numerical issues or implementation problems.")
-    

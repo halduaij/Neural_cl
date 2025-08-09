@@ -49,7 +49,7 @@ class OpInfReducer(BaseReducer):
         self.stability_margin = 1.0  # Eigenvalue margin for stability
         self.use_energy_basis = True
         self.disable_unstable_dynamics = True
-        self.regularization_factor = 1.0  # Base regularization
+        self.regularization_factor = 0.1  # Base regularization
 
     def fit(self, X, Xdot, V_fn, V_min):
         """
