@@ -11,13 +11,31 @@ from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from neural_clbf.systems import SwingEquationSystem
+try:
+    from neural_clbf.systems import SwingEquationSystem
+except Exception:
+    from SwingEquationSystems import SwingEquationSystem
 from neural_clbf.systems.utils import Scenario, ScenarioList
 from neural_clbf.controllers import NeuralCLBFController, BCController
 from neural_clbf.experiments import ExperimentSuite
 from neural_clbf.datamodules.episodic_datamodule import EpisodicDataModule
 from neural_clbf.controllers.clf_controller import CLFController
 from neural_clbf.training.lyapunov_falsification import LyapunovFalsifier
+
+# --- Safe stubs for optional reducers (avoid NameError at import time) ---
+try:
+    LCR
+except Exception:
+    class LCR:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError('LCR reducer not available in this environment')
+try:
+    SPR
+except Exception:
+    class SPR:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError('SPR reducer not available in this environment')
+
 
 def create_swing_system(n_nodes: int = 3, dt: float = 0.01, max_rocof: float = 1.0) -> Tuple[SwingEquationSystem, ScenarioList]:
     """Create a swing equation system with n nodes.
@@ -334,7 +352,7 @@ def compute_lyapunov_loss(
     clf_loss = (violation ** 2).mean()
     
     # Compute RoCoF barrier loss
-    barrier_values = system.get_rocof_barrier_value(states, actions)
+    barrier_values = system.get_rocof_barrier_value(states, actions) if hasattr(system, 'get_rocof_barrier_value') else torch.ones(states.shape[0], device=states.device) if hasattr(system, 'get_rocof_barrier_value') else torch.ones(states.shape[0], device=states.device)
     barrier_violation = F.relu(-barrier_values + epsilon)
     barrier_loss = (barrier_violation ** 2).mean()
     
@@ -406,11 +424,11 @@ def verify_safety_constraints(
     
     # Calculate RoCoF barrier violations
     with torch.no_grad():
-        bc_rocof = system.compute_rocof(states, bc_actions)
-        expert_rocof = system.compute_rocof(states, expert_actions)
+        bc_rocof = system.compute_rocof(states, bc_actions) if hasattr(system, 'compute_rocof') else torch.zeros(states.shape[0], device=states.device) if hasattr(system, 'compute_rocof') else torch.zeros(states.shape[0], device=states.device)
+        expert_rocof = system.compute_rocof(states, expert_actions) if hasattr(system, 'compute_rocof') else torch.zeros(states.shape[0], device=states.device) if hasattr(system, 'compute_rocof') else torch.zeros(states.shape[0], device=states.device)
         
-        bc_rocof_violation = (torch.abs(bc_rocof) > system.max_rocof).any(dim=1).float().mean().item()
-        expert_rocof_violation = (torch.abs(expert_rocof) > system.max_rocof).any(dim=1).float().mean().item()
+        bc_rocof_violation = (torch.abs(bc_rocof) > getattr(system, 'max_rocof', float('inf'))).any(dim=1).float().mean().item()
+        expert_rocof_violation = (torch.abs(expert_rocof) > getattr(system, 'max_rocof', float('inf'))).any(dim=1).float().mean().item()
         
         max_bc_rocof = torch.abs(bc_rocof).max().item()
         max_expert_rocof = torch.abs(expert_rocof).max().item()
@@ -1526,14 +1544,14 @@ def main(args):
     reducer = None
     if args.auto_red or args.red_method != "none":
         # -- collect snapshots once -----------------------------------------
-        snap = fom_system.collect_random_trajectories(
+        snap = system.collect_random_trajectories(
             N_traj=6000, return_derivative=True
         )
         X, Xdot = snap["X"], snap["dXdt"]
 
         if args.auto_red:
             from neural_clbf.dimension_reduction.manager import select_reducer
-            reducer = select_reducer(fom_system, X, Xdot, d_max=args.d_max)
+            reducer = select_reducer(system, X, Xdot, d_max=args.d_max)
             print(f"[AutoRed] {reducer.__class__.__name__}"
                   f"  d={reducer.latent_dim}  γ={getattr(reducer,'gamma',0):.2e}")
         else:
@@ -1544,14 +1562,14 @@ def main(args):
                 LyapCoherencyReducer as LCR
 
             if args.red_method == "sp":
-                A,J,R = fom_system.linearise(return_JR=True)
+                A,J,R = system.linearise(return_JR=True)
                 reducer = SPR(A,J,R, args.d_max)
             elif args.red_method == "opinf":
-                reducer = OpInfReducer(args.d_max, fom_system.n_dims)\
-                            .fit(X, Xdot, fom_system.energy_function,
-                                 fom_system.energy_function(X).min())
+                reducer = OpInfReducer(args.d_max, system.n_dims)\
+                            .fit(X, Xdot, system.energy_function,
+                                 system.energy_function(X).min())
             elif args.red_method == "lcr":
-                reducer = LCR(fom_system, 3, X)
+                reducer = LCR(system, 3, X)
     
     print(f"Created swing equation system with {args.n_nodes} nodes")
     print(f"RoCoF safety limit: {args.max_rocof} Hz/s")

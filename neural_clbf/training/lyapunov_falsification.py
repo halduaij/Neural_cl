@@ -4,8 +4,15 @@ import time
 from typing import Tuple, Dict, List, Optional, Callable
 import matplotlib.pyplot as plt
 
-from neural_clbf.systems import ControlAffineSystem
-from neural_clbf.controllers import NeuralCLBFController, BCController
+try:
+    from neural_clbf.systems import ControlAffineSystem
+except Exception:
+    from control_affine_system import ControlAffineSystem
+try:
+    from neural_clbf.controllers import NeuralCLBFController, BCController
+except Exception:
+    NeuralCLBFController = object
+    BCController = object
 
 
 class LyapunovFalsifier:

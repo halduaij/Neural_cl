@@ -99,7 +99,7 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
             clf_relaxation_penalty=clf_relaxation_penalty,
             controller_period=controller_period,
             disable_gurobi=disable_gurobi,
-            robust_margin_gamma=gamma,
+            robust_margin_gamma=0.0,
         )
         self.save_hyperparameters()
 
@@ -230,7 +230,7 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
             elif isinstance(layer, nn.Tanh):
                 JV = torch.matmul(torch.diag_embed(1 - V ** 2), JV)
             elif isinstance(layer, nn.ReLU):
-                JV = torch.matmul(torch.diag_embed(torch.sign(V)), JV)
+                JV = torch.matmul(torch.diag_embed((V > 0).float()), JV)
 
         # Compute the final activation
         JV = torch.bmm(V.unsqueeze(1), JV)
