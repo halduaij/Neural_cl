@@ -178,29 +178,16 @@ class CLFController(Controller):
 
         for i in range(n_scenarios):
             s = scenarios[i]
-            # We do NOT need grads through the algebraic Newton solve here.
-            with torch.no_grad():
-                f, g = self.dynamics_model.control_affine_dynamics(x, params=s)
+            f, g = self.dynamics_model.control_affine_dynamics(x, params=s)
 
-            # FIX: Handle the case where f has shape (batch, n_dims, 1)
-            if f.dim() == 3 and f.shape[-1] == 1:
-                f = f.squeeze(-1)  # Convert (B, D, 1) to (B, D)
-            # Gradients to CLF params still flow via gradV; f,g are treated as constants.
-            # gradV: (B,1,D); f: (B,D)  → inner product per batch
-            Lf_V[:, i, :] = torch.einsum("bnd,bd->bn", gradV, f)
+            Lf_V[:, i, :] = torch.bmm(gradV, f).squeeze(1)
             Lg_V[:, i, :] = torch.bmm(gradV, g).squeeze(1)
+
         return Lf_V, Lg_V
-# --- a) u_reference: detach the nominal u ---
+
     def u_reference(self, x: torch.Tensor) -> torch.Tensor:
-        """Reference control: use model.u_nominal(x) if available, else u_eq."""
-        if hasattr(self.dynamics_model, "u_nominal"):
-            with torch.no_grad():
-                u0 = self.dynamics_model.u_nominal(x.detach())
-            return u0.type_as(x)
-        ue = self.dynamics_model.u_eq
-        if ue.dim() == 1:
-            ue = ue.unsqueeze(0)
-        return ue.expand(x.shape[0], -1).type_as(x)
+        """Determine the reference control input."""
+        return self.dynamics_model.u_nominal(x)
 
     def _get_cache_key(self, x: torch.Tensor) -> str:
         """Generate a cache key for a state tensor."""
@@ -254,8 +241,8 @@ class CLFController(Controller):
         result = self.differentiable_qp_solver(
             *params,
             solver_args={
-                "max_iters": 300,  # Increased from 1000
-                "eps": 1e-3,  # Tighter tolerance
+                "max_iters": 2000,  # Increased from 1000
+                "eps": 1e-6,  # Tighter tolerance
                 "verbose": False,
             },
         )
@@ -264,7 +251,7 @@ class CLFController(Controller):
         r_result = torch.hstack(result[1:])
 
         return u_result.type_as(x), r_result.type_as(x)
-# --- b) solve_CLF_QP: truly non-diff when requires_grad=False ---
+
     def solve_CLF_QP(
         self,
         x,
@@ -272,7 +259,8 @@ class CLFController(Controller):
         u_ref: Optional[torch.Tensor] = None,
         requires_grad: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Cache for non-diff calls (your existing code)
+        """Determine the control input for a given state using a QP"""
+        # Check cache first if not requiring gradients
         if not requires_grad:
             cache_key = self._get_cache_key(x)
             if cache_key in self.cache:
@@ -287,18 +275,14 @@ class CLFController(Controller):
         if relaxation_penalty is None:
             relaxation_penalty = self.clf_relaxation_penalty
 
+        # Ensure only CVXPY solver is used
+        result = self._solve_CLF_QP_cvxpylayers(x, u_ref, V, Lf_V, Lg_V, relaxation_penalty)
+
+        # Cache the result if not requiring gradients
         if not requires_grad:
-            with torch.no_grad():
-                u_res, r_res = self._solve_CLF_QP_cvxpylayers(
-                    x, u_ref.detach(), V.detach(), Lf_V.detach(), Lg_V.detach(), relaxation_penalty
-                )
-            result = (u_res.detach().type_as(x), r_res.detach().type_as(x))
             self._update_cache(cache_key, result)
-            return result
 
-        # differentiable path (for future policy training)
-        return self._solve_CLF_QP_cvxpylayers(x, u_ref, V, Lf_V, Lg_V, relaxation_penalty)
-
+        return result
 
     def u(self, x):
         """Get the control input for a given state"""

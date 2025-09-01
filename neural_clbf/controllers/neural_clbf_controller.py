@@ -47,12 +47,14 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
         add_nominal: bool = True,
         normalize_V_nominal: bool = True,
         disable_gurobi: bool = False,
-        use_batch_norm: bool = True,
-        dropout_rate: float = 0.1,
+        use_batch_norm: bool = False,
+        dropout_rate: float = 0,
         reducer=None,
     ):
         """Initialize the controller."""
-        super(NeuralCLBFController, self).__init__(
+        pl.LightningModule.__init__(self)
+        CLFController.__init__(
+            self,
             dynamics_model=dynamics_model,
             scenarios=scenarios,
             experiment_suite=experiment_suite,
@@ -124,8 +126,10 @@ class NeuralCLBFController(pl.LightningModule, CLFController):
 
     def V_with_jacobian(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes the CLBF value and its Jacobian"""
-        x_norm = normalize_with_angles(self.dynamics_model, x, self.x_center, self.x_range)
-
+        x_norm = (x - self.x_center.type_as(x)) / self.x_range.type_as(x)
+        angles = x[:, self.dynamics_model.angle_dims]
+        x_norm[:, self.dynamics_model.angle_dims] = torch.sin(angles)
+        x_norm = torch.cat([x_norm, torch.cos(angles)], dim=-1)
         bs = x_norm.shape[0]
         JV = torch.zeros(
             (bs, self.n_dims_extended, self.dynamics_model.n_dims)

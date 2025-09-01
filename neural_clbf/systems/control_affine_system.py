@@ -547,6 +547,7 @@ class ControlAffineSystem(ABC):
         """
         pass
 
+
     @abstractmethod
     def _g(self, x: torch.Tensor, params: Scenario) -> torch.Tensor:
         """
